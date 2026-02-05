@@ -41,7 +41,7 @@ These are optional. Defaults are shown.
 
 ```
 MC_EMAIL=your@email.com
-MC_PASSWORD=yourpassword //Dont use if using MC_AUTH=microsoft
+MC_PASSWORD=yourpassword //Dont use if you're using MC_AUTH=microsoft
 MC_HOST=serverip
 MC_VERSION=1.20.2
 MC_AUTH=microsoft
