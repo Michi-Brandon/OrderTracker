@@ -1,0 +1,860 @@
+﻿'use strict'
+
+const mineflayer = require('mineflayer')
+const http = require('http')
+const fs = require('fs')
+const path = require('path')
+const MinecraftData = require('minecraft-data')
+
+let mineflayerViewer = null
+let viewerLoadError = null
+
+async function loadViewer () {
+  if (mineflayerViewer) return mineflayerViewer
+  if (viewerLoadError) return null
+
+  try {
+    const mod = require('prismarine-viewer')
+    mineflayerViewer = mod.mineflayer || (mod.default && mod.default.mineflayer) || mod
+    return mineflayerViewer
+  } catch (err) {
+    if (err && err.code === 'ERR_REQUIRE_ESM') {
+      try {
+        const mod = await import('prismarine-viewer')
+        mineflayerViewer = mod.mineflayer || (mod.default && mod.default.mineflayer) || mod
+        return mineflayerViewer
+      } catch (err2) {
+        viewerLoadError = err2
+        return null
+      }
+    }
+    viewerLoadError = err
+    return null
+  }
+}
+
+const args = process.argv.slice(2)
+const username = args[0] || process.env.MC_EMAIL
+const password = args[1] || process.env.MC_PASSWORD
+
+if (!username) {
+  console.error('Usage: node x.js <email> [password]')
+  console.error('Or set MC_EMAIL (and optionally MC_PASSWORD) in your environment.')
+  process.exit(1)
+}
+
+const host = process.env.MC_HOST || 'donutsmp.net'
+const version = process.env.MC_VERSION || '1.20.2'
+const auth = process.env.MC_AUTH || 'microsoft'
+const viewerPort = Number(process.env.VIEWER_PORT || 3007)
+const enableViewer = process.env.VIEWER !== '0'
+const enableOrders = true
+const ordersIntervalMs = Number(process.env.ORDERS_INTERVAL_MS || 60000)
+const ordersOpenTimeoutMs = Number(process.env.ORDERS_OPEN_TIMEOUT_MS || 15000)
+const ordersCloseDelayMs = Number(process.env.ORDERS_CLOSE_DELAY_MS || 800)
+const ordersStartDelayMs = Number(process.env.ORDERS_START_DELAY_MS || 7000)
+const ordersHumanDelayMinMs = Number(process.env.ORDERS_HUMAN_DELAY_MIN_MS || 300)
+const ordersHumanDelayMaxMs = Number(process.env.ORDERS_HUMAN_DELAY_MAX_MS || 900)
+const ordersSchedulerIntervalMs = Number(process.env.ORDERS_SCHEDULER_INTERVAL_MS || 1000)
+const ordersApiPort = Number(process.env.ORDERS_API_PORT || 3010)
+const ordersAutoTrack = process.env.ORDERS_AUTOTRACK !== '0'
+const ordersProductKey = process.env.ORDERS_PRODUCT || 'repeater'
+const ordersCommandPrefix = process.env.ORDERS_CMD_PREFIX || `/orders`
+
+const ordersLogPath = path.join(__dirname, 'orders-snapshots.jsonl')
+const ordersAliasesPath = path.join(__dirname, 'orders-aliases.json')
+const ordersTrackedPath = path.join(__dirname, 'orders-tracked.json')
+
+const minecraft = MinecraftData(version)
+const enchantmentDict = minecraft.enchantmentsArray.reduce((acc, e) => {
+  acc[e.displayName] = e.name
+  return acc
+}, {})
+
+const botOptions = {
+  host,
+  username,
+  auth,
+  version
+}
+
+if (password && auth !== 'microsoft') {
+  botOptions.password = password
+} else if (password && auth === 'microsoft') {
+  console.warn('Password ignored for microsoft auth. You will be prompted to login with a browser code.')
+}
+
+const bot = mineflayer.createBot(botOptions)
+
+let expectOrdersWindow = false
+let ordersInFlight = false
+let ordersOpenTimeout = null
+let schedulerTimer = null
+let currentTask = null
+let pendingChatMessage = null
+
+const trackedProducts = new Map()
+const pendingQueue = []
+const pendingSet = new Set()
+const orderAliases = new Map()
+const trackedOrder = []
+
+loadAliases()
+loadTrackedList()
+
+bot.once('spawn', () => {
+  console.log(`Spawned on ${host} as ${bot.username} (version ${version}, auth ${auth})`)
+
+  if (enableViewer) {
+    startViewerIfEnabled().catch((err) => {
+      console.warn('Failed to start prismarine-viewer:', err && err.message ? err.message : err)
+    })
+  }
+
+  startOrdersApiServer()
+  setTimeout(() => {
+    const restored = rehydrateTrackedList()
+    if (!restored && ordersAutoTrack && ordersProductKey) {
+      trackProduct(ordersProductKey, { immediate: true })
+    }
+    startScheduler()
+  }, ordersStartDelayMs)
+})
+
+function normalizeProductKey (value) {
+  return (value || '')
+    .toLowerCase()
+    .replace(/["']/g, '')
+    .replace(/[^a-z0-9\s_\-]/g, '')
+    .trim()
+    .replace(/[\s\-]+/g, '_')
+}
+
+function sanitizeCommandName (value) {
+  return String(value || '').trim().replace(/\s+/g, ' ')
+}
+
+function loadAliases () {
+  try {
+    if (!fs.existsSync(ordersAliasesPath)) return
+    const raw = fs.readFileSync(ordersAliasesPath, 'utf8')
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object') return
+    for (const [key, command] of Object.entries(parsed)) {
+      const normalized = normalizeProductKey(key)
+      const cleaned = sanitizeCommandName(command)
+      if (normalized && cleaned) {
+        orderAliases.set(normalized, cleaned)
+      }
+    }
+  } catch (err) {
+    console.warn('Failed to load aliases:', err && err.message ? err.message : err)
+  }
+}
+
+function loadTrackedList () {
+  try {
+    if (!fs.existsSync(ordersTrackedPath)) return
+    const raw = fs.readFileSync(ordersTrackedPath, 'utf8')
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return
+    trackedOrder.length = 0
+    for (const entry of parsed) {
+      const key = normalizeProductKey(typeof entry === 'string' ? entry : entry?.key)
+      if (key && !trackedOrder.includes(key)) {
+        trackedOrder.push(key)
+      }
+    }
+  } catch (err) {
+    console.warn('Failed to load tracked list:', err && err.message ? err.message : err)
+  }
+}
+
+function saveTrackedList () {
+  try {
+    fs.writeFileSync(ordersTrackedPath, JSON.stringify(trackedOrder, null, 2), 'utf8')
+  } catch (err) {
+    console.warn('Failed to save tracked list:', err && err.message ? err.message : err)
+  }
+}
+
+function saveAliases () {
+  try {
+    const payload = Object.fromEntries(orderAliases.entries())
+    fs.writeFileSync(ordersAliasesPath, JSON.stringify(payload, null, 2), 'utf8')
+  } catch (err) {
+    console.warn('Failed to save aliases:', err && err.message ? err.message : err)
+  }
+}
+
+function setAlias (productKey, commandName) {
+  const key = normalizeProductKey(productKey)
+  if (!key) return null
+  const cleaned = sanitizeCommandName(commandName)
+  if (!cleaned) {
+    orderAliases.delete(key)
+    saveAliases()
+    return null
+  }
+  orderAliases.set(key, cleaned)
+  saveAliases()
+  const tracked = trackedProducts.get(key)
+  if (tracked) tracked.commandName = cleaned
+  return cleaned
+}
+
+function getAlias (productKey) {
+  const key = normalizeProductKey(productKey)
+  if (!key) return null
+  return orderAliases.get(key) || null
+}
+
+function getCommandName (productKey) {
+  return getAlias(productKey) || productKey
+}
+
+function randomBetween (min, max) {
+  const low = Number.isFinite(min) ? min : 0
+  const high = Number.isFinite(max) ? max : low
+  if (high <= low) return low
+  return Math.floor(low + Math.random() * (high - low))
+}
+
+function enqueueProduct (productKey) {
+  if (!productKey) return
+  if (pendingSet.has(productKey)) return
+  if (currentTask && currentTask.productKey === productKey) return
+  pendingQueue.push(productKey)
+  pendingSet.add(productKey)
+}
+
+function trackProduct (productKey, options = {}) {
+  const key = normalizeProductKey(productKey)
+  if (!key) return null
+
+  if (options.commandName) {
+    setAlias(key, options.commandName)
+  }
+
+  const now = Date.now()
+  const existing = trackedProducts.get(key)
+  if (!existing) {
+    trackedProducts.set(key, {
+      key,
+      intervalMs: ordersIntervalMs,
+      nextRunAt: now,
+      lastRunAt: null,
+      commandName: getCommandName(key)
+    })
+    if (!options.restore) {
+      if (!trackedOrder.includes(key)) trackedOrder.push(key)
+      saveTrackedList()
+    }
+    enqueueProduct(key)
+    return key
+  }
+
+  if (options.immediate) {
+    existing.nextRunAt = now
+    enqueueProduct(key)
+  }
+
+  if (!trackedOrder.includes(key)) {
+    trackedOrder.push(key)
+    saveTrackedList()
+  }
+  existing.commandName = getCommandName(key)
+  return key
+}
+
+function untrackProduct (productKey) {
+  const key = normalizeProductKey(productKey)
+  if (!key) return false
+  trackedProducts.delete(key)
+  pendingSet.delete(key)
+  const idx = pendingQueue.indexOf(key)
+  if (idx >= 0) pendingQueue.splice(idx, 1)
+  const orderIdx = trackedOrder.indexOf(key)
+  if (orderIdx >= 0) trackedOrder.splice(orderIdx, 1)
+  saveTrackedList()
+  return true
+}
+
+function rehydrateTrackedList () {
+  if (trackedOrder.length === 0) return false
+  trackedOrder.forEach((key, index) => {
+    setTimeout(() => {
+      trackProduct(key, { immediate: true, restore: true })
+    }, index * 1000)
+  })
+  return true
+}
+
+function startScheduler () {
+  if (schedulerTimer) return
+  schedulerTimer = setInterval(() => {
+    schedulerTick()
+  }, ordersSchedulerIntervalMs)
+  schedulerTick()
+}
+
+function schedulerTick () {
+  const now = Date.now()
+  for (const key of trackedOrder) {
+    const entry = trackedProducts.get(key)
+    if (!entry) continue
+    if (now >= entry.nextRunAt) {
+      enqueueProduct(key)
+      while (entry.nextRunAt <= now) {
+        entry.nextRunAt += entry.intervalMs
+      }
+    }
+  }
+  processQueue()
+}
+
+function processQueue () {
+  if (!enableOrders) return
+  if (currentTask || ordersInFlight) return
+  if (pendingQueue.length === 0) return
+
+  const productKey = pendingQueue.shift()
+  pendingSet.delete(productKey)
+
+  currentTask = {
+    productKey,
+    commandName: getCommandName(productKey),
+    startedAt: Date.now()
+  }
+
+  issueOrdersCommand(productKey)
+}
+
+function issueOrdersCommand (productKey) {
+  if (!productKey) {
+    finishCurrentTask()
+    return
+  }
+  const commandName = currentTask?.commandName || getCommandName(productKey) || productKey
+  const command = `${ordersCommandPrefix} ${commandName}`.trim()
+  ordersInFlight = true
+  expectOrdersWindow = true
+  bot.chat(command)
+  console.log(`Sent command: ${command}`)
+
+  if (ordersOpenTimeout) clearTimeout(ordersOpenTimeout)
+  ordersOpenTimeout = setTimeout(() => {
+    if (ordersInFlight && currentTask?.productKey === productKey) {
+      console.log(`Orders window timeout for ${productKey}; will retry on next interval.`)
+      ordersInFlight = false
+      expectOrdersWindow = false
+      finishCurrentTask()
+    }
+  }, ordersOpenTimeoutMs)
+}
+
+function finishCurrentTask () {
+  currentTask = null
+  ordersInFlight = false
+  expectOrdersWindow = false
+  if (ordersOpenTimeout) {
+    clearTimeout(ordersOpenTimeout)
+    ordersOpenTimeout = null
+  }
+
+  const delay = randomBetween(ordersHumanDelayMinMs, ordersHumanDelayMaxMs)
+  if (delay > 0) {
+    setTimeout(processQueue, delay)
+  } else {
+    processQueue()
+  }
+
+  trySendPendingChat()
+}
+
+function trySendPendingChat () {
+  if (!pendingChatMessage) return
+  if (ordersInFlight || currentTask) return
+  const message = pendingChatMessage
+  pendingChatMessage = null
+  try {
+    bot.chat(message)
+    console.log(`Sent chat: ${message}`)
+  } catch (err) {
+    console.warn('Failed to send chat message:', err && err.message ? err.message : err)
+  }
+}
+
+function readJsonBody (req) {
+  return new Promise((resolve, reject) => {
+    let body = ''
+    req.on('data', (chunk) => {
+      body += chunk
+    })
+    req.on('end', () => {
+      if (!body) return resolve({})
+      try {
+        resolve(JSON.parse(body))
+      } catch (err) {
+        reject(err)
+      }
+    })
+    req.on('error', reject)
+  })
+}
+
+function sendJson (res, status, payload) {
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type'
+  })
+  res.end(JSON.stringify(payload))
+}
+
+function startOrdersApiServer () {
+  if (startOrdersApiServer.started) return
+  startOrdersApiServer.started = true
+
+  const server = http.createServer(async (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*')
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS')
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204)
+      res.end()
+      return
+    }
+
+    const url = new URL(req.url, `http://${req.headers.host}`)
+
+    if (url.pathname === '/track' && req.method === 'POST') {
+      try {
+        const payload = await readJsonBody(req)
+        const productKey = normalizeProductKey(payload.productKey || payload.product || '')
+        const commandName = payload.commandName || payload.ordersName || payload.command || payload.query || ''
+        if (!productKey) {
+          sendJson(res, 400, { ok: false, error: 'Missing productKey' })
+          return
+        }
+        const key = trackProduct(productKey, { immediate: true, commandName })
+        sendJson(res, 200, { ok: true, productKey: key })
+        return
+      } catch (err) {
+        sendJson(res, 400, { ok: false, error: 'Invalid JSON body' })
+        return
+      }
+    }
+
+    if (url.pathname === '/untrack' && req.method === 'POST') {
+      try {
+        const payload = await readJsonBody(req)
+        const productKey = normalizeProductKey(payload.productKey || payload.product || '')
+        if (!productKey) {
+          sendJson(res, 400, { ok: false, error: 'Missing productKey' })
+          return
+        }
+        untrackProduct(productKey)
+        sendJson(res, 200, { ok: true, productKey })
+        return
+      } catch (err) {
+        sendJson(res, 400, { ok: false, error: 'Invalid JSON body' })
+        return
+      }
+    }
+
+    if (url.pathname === '/alias' && req.method === 'POST') {
+      try {
+        const payload = await readJsonBody(req)
+        const productKey = normalizeProductKey(payload.productKey || payload.product || '')
+        const commandName = payload.commandName || payload.ordersName || payload.command || payload.query || ''
+        if (!productKey) {
+          sendJson(res, 400, { ok: false, error: 'Missing productKey' })
+          return
+        }
+        const alias = setAlias(productKey, commandName)
+        sendJson(res, 200, { ok: true, productKey, commandName: alias })
+        return
+      } catch (err) {
+        sendJson(res, 400, { ok: false, error: 'Invalid JSON body' })
+        return
+      }
+    }
+
+    if (url.pathname === '/say' && req.method === 'POST') {
+      try {
+        const payload = await readJsonBody(req)
+        const message = String(payload.message || payload.text || '').trim()
+        if (!message) {
+          sendJson(res, 400, { ok: false, error: 'Missing message' })
+          return
+        }
+        pendingChatMessage = message.slice(0, 255)
+        trySendPendingChat()
+        sendJson(res, 200, { ok: true })
+        return
+      } catch (err) {
+        sendJson(res, 400, { ok: false, error: 'Invalid JSON body' })
+        return
+      }
+    }
+
+    if (url.pathname === '/queue' && req.method === 'GET') {
+      const tracked = [...trackedOrder]
+      const items = tracked
+        .map((key) => trackedProducts.get(key))
+        .filter(Boolean)
+        .map((entry) => ({
+          key: entry.key,
+          intervalMs: entry.intervalMs,
+          nextRunAt: entry.nextRunAt,
+          lastRunAt: entry.lastRunAt,
+          commandName: entry.commandName || getCommandName(entry.key)
+        }))
+      sendJson(res, 200, {
+        ok: true,
+        tracked,
+        aliases: Object.fromEntries(orderAliases.entries()),
+        items,
+        pending: [...pendingQueue],
+        current: currentTask ? currentTask.productKey : null
+      })
+      return
+    }
+
+    sendJson(res, 404, { ok: false, error: 'Not found' })
+  })
+
+  server.listen(ordersApiPort, () => {
+    console.log(`Orders API running at http://localhost:${ordersApiPort}`)
+  })
+}
+
+function closeOrdersWindow (window) {
+  try {
+    bot.closeWindow(window)
+    return
+  } catch (err) {
+    // fallback below
+  }
+
+  if (bot._client && window && typeof window.id === 'number') {
+    try {
+      bot._client.write('close_window', { windowId: window.id })
+    } catch (err) {
+      console.warn('Failed to close orders window:', err && err.message ? err.message : err)
+    }
+  }
+}
+
+bot.on('windowOpen', (window) => {
+  if (!enableOrders || !expectOrdersWindow) {
+    return
+  }
+
+  expectOrdersWindow = false
+  ordersInFlight = false
+  if (ordersOpenTimeout) {
+    clearTimeout(ordersOpenTimeout)
+    ordersOpenTimeout = null
+  }
+  const productKey = currentTask?.productKey || ordersProductKey
+  captureOrdersSnapshot(window, { page: 1, productKey })
+  const tracked = trackedProducts.get(productKey)
+  if (tracked) {
+    tracked.lastRunAt = Date.now()
+  }
+
+  const closeDelay = Math.max(ordersCloseDelayMs, 0)
+  setTimeout(() => {
+    closeOrdersWindow(window)
+    finishCurrentTask()
+  }, closeDelay)
+})
+
+bot.on('kicked', (reason) => {
+  console.log('Kicked:', reason)
+})
+
+bot.on('error', (err) => {
+  console.log('Error:', err)
+})
+
+bot.on('end', () => {
+  console.log('Disconnected')
+})
+
+
+function captureOrdersSnapshot (window, meta) {
+  return dumpWindowSlotsWithMeta(window, meta)
+}
+
+function dumpWindowSlots (window) {
+  return dumpWindowSlotsWithMeta(window, {})
+}
+
+function dumpWindowSlotsWithMeta (window, meta) {
+  if (!window || !Array.isArray(window.slots)) {
+    return null
+  }
+
+  const containerSlots = getContainerSlotCount(window)
+
+  const slots = []
+  for (let i = 0; i < containerSlots; i += 1) {
+    const item = window.slots[i]
+    const itemInfo = item
+      ? {
+          name: item.name || null,
+          displayName: item.displayName || item.customName || null,
+          count: item.count ?? null
+        }
+      : null
+
+    let order = null
+    let loreText = []
+    const parsed = parseOrderFromItem(item)
+    if (parsed) {
+      order = parsed.order
+      loreText = parsed.loreText
+    }
+
+    slots.push({
+      slot: i,
+      item: itemInfo,
+      order,
+      loreText
+    })
+  }
+
+  const snapshot = buildOrdersSnapshot(slots, meta)
+  recordPageSnapshot(snapshot)
+  return snapshot
+}
+
+function formatItem (item) {
+  if (!item) return 'empty'
+  const name = item.name || 'unknown'
+  const display = item.displayName && item.displayName !== name ? ` (${item.displayName})` : ''
+  const count = item.count != null ? ` x${item.count}` : ''
+  return `${name}${display}${count}`
+}
+
+function getContainerSlotCount (window) {
+  if (window && typeof window.inventoryStart === 'number') {
+    return window.inventoryStart
+  }
+
+  const type = typeof window?.type === 'string' ? window.type : ''
+  const match = /generic_9x(\d)/.exec(type)
+  if (match) return 9 * Number(match[1])
+
+  return Array.isArray(window?.slots) ? window.slots.length : 0
+}
+
+async function startViewerIfEnabled () {
+  const viewer = await loadViewer()
+  if (!viewer) {
+    if (viewerLoadError) {
+      const code = viewerLoadError.code ? ` (${viewerLoadError.code})` : ''
+      console.warn(`prismarine-viewer not available${code}: ${viewerLoadError.message}`)
+    } else {
+      console.warn('prismarine-viewer is not installed. Run: npm install prismarine-viewer')
+    }
+    return
+  }
+
+  if (typeof viewer !== 'function') {
+    console.warn('prismarine-viewer loaded but did not export a viewer function.')
+    return
+  }
+
+  viewer(bot, { port: viewerPort, firstPerson: true })
+  console.log(`Viewer running at http://localhost:${viewerPort}`)
+}
+
+
+function getLoreLines (item) {
+  if (!item) return []
+  if (Array.isArray(item.customLore) && item.customLore.length > 0) return item.customLore
+
+  const lore =
+    item.nbt?.value?.display?.value?.Lore?.value?.value ||
+    item.nbt?.value?.display?.value?.Lore?.value ||
+    null
+
+  return Array.isArray(lore) ? lore : []
+}
+
+function mapLoreLegacy (lore) {
+  return lore.map((line) => {
+    if (typeof line !== 'string') return String(line)
+    const trimmed = line.trim()
+    if (!trimmed) return ''
+    try {
+      const parsed = JSON.parse(trimmed)
+      if (Array.isArray(parsed?.extra)) {
+        return parsed.extra.map((e) => e.text || '').join('')
+      }
+      if (typeof parsed === 'string') return parsed
+      if (typeof parsed?.text === 'string') return parsed.text
+    } catch (err) {
+      // Not JSON, keep as-is.
+    }
+    return line
+  }).flat()
+}
+
+const levels = {
+  I: 1,
+  II: 2,
+  III: 3,
+  IV: 4,
+  V: 5,
+  VI: 6,
+  VII: 7,
+  VIII: 8,
+  IX: 9,
+  X: 10
+}
+
+function mapEnchantmentsLegacy (enchants) {
+  const result = []
+  for (const enchant of enchants) {
+    const parts = enchant.trim().split(' ')
+    const last = parts[parts.length - 1]
+    const hasLevel = last && Object.prototype.hasOwnProperty.call(levels, last)
+    const level = hasLevel ? levels[last] ?? 1 : 1
+    const nameOnly = hasLevel ? parts.slice(0, -1).join(' ') : parts.join(' ')
+    const mapped = enchantmentDict[nameOnly]
+    if (mapped) result.push({ name: mapped, level })
+  }
+  return result
+}
+
+function parseDuration (durationStr) {
+  const parts = durationStr.split(' ')
+  let ms = 0
+  for (const part of parts) {
+    if (part.endsWith('d')) ms += parseInt(part, 10) * 86_400_000
+    else if (part.endsWith('h')) ms += parseInt(part, 10) * 3_600_000
+    else if (part.endsWith('m')) ms += parseInt(part, 10) * 60_000
+    else if (part.endsWith('s')) ms += parseInt(part, 10) * 1_000
+  }
+  return ms
+}
+
+function parseCompactNumber (str) {
+  const num = parseFloat(str)
+  if (str.endsWith('K')) return num * 1_000
+  if (str.endsWith('M')) return num * 1_000_000
+  if (str.endsWith('B')) return num * 1_000_000_000
+  return num
+}
+
+function roundDownToInterval (value, intervalMs) {
+  return Math.floor(value / intervalMs) * intervalMs
+}
+
+function parseOrderFromItem (item) {
+  const rawLore = getLoreLines(item)
+  if (!rawLore || rawLore.length === 0) return null
+
+  const loreText = mapLoreLegacy(rawLore).map((line) => (typeof line === 'string' ? line.trim() : String(line).trim()))
+  const name = item.displayName || item.customName || item.name || 'unknown'
+
+  try {
+    const order = parseLore(name, loreText)
+    return { order, rawLore, loreText }
+  } catch (err) {
+    return null
+  }
+}
+
+function parseLore (name, lore) {
+  const priceLineIndex = lore.findIndex((line) => /^\$\d/.test(line))
+  const enchantments = mapEnchantmentsLegacy(lore.slice(1, priceLineIndex).filter((line) => line.trim() !== ''))
+
+  const priceLine = lore[priceLineIndex]
+  if (!priceLine) throw new Error('No price found in lore')
+  const priceRaw = priceLine.split(' ')[0]?.replace('$', '')
+  if (!priceRaw) throw new Error('priceRaw is undefined')
+  const price = parseCompactNumber(priceRaw)
+
+  const deliveredLine = lore.find((line) => /^[\d.KMB]+\/[\d.KMB]+ Delivered$/.test(line))
+  const [deliveredRaw, orderedRaw] = deliveredLine?.split(' Delivered')[0]?.split('/') ?? [undefined, undefined]
+  if (!deliveredRaw || !orderedRaw) throw new Error('DeliveredRaw or OrderedRaw is undefined')
+  const delivered = Math.floor(parseCompactNumber(deliveredRaw))
+  const ordered = Math.floor(parseCompactNumber(orderedRaw))
+
+  const clickLine = lore.find((line) => line.startsWith('Click to deliver '))
+  if (!clickLine) throw new Error('Username is undefined')
+  const username = clickLine.split(' ')[3]
+  if (!username) throw new Error('Username is undefined')
+
+  const durationLine = lore[lore.length - 1]
+  if (!durationLine) throw new Error('DurationLine is undefined')
+  const duration = durationLine.split(' Until')[0]
+  if (!duration) throw new Error('Duration is undefined')
+  const expiresAt = roundDownToInterval(Date.now() + parseDuration(duration), 300_000)
+
+  return {
+    name,
+    enchantments,
+    price,
+    amountOrdered: ordered,
+    amountDelivered: delivered,
+    userName: username,
+    expiresAt,
+    source: 'order'
+  }
+}
+
+function buildOrdersSnapshot (slots, meta) {
+  const nowIso = new Date().toISOString()
+  const page = meta && meta.page ? meta.page : 1
+  const productKey = meta?.productKey || currentTask?.productKey || ordersProductKey
+
+  const namedSlot = slots.find((s) => s.order?.name) || slots.find((s) => s.item?.displayName)
+  const productName = meta?.productName || namedSlot?.order?.name || namedSlot?.item?.displayName || productKey
+
+  const orderSlots = slots.filter((s) => s.order)
+  orderSlots.sort((a, b) => {
+    if (b.order.price !== a.order.price) return b.order.price - a.order.price
+    return b.order.amountOrdered - a.order.amountOrdered
+  })
+
+  const maxSlot = orderSlots[0]
+  const max = maxSlot
+    ? {
+        price: maxSlot.order.price,
+        amountOrdered: maxSlot.order.amountOrdered,
+        amountDelivered: maxSlot.order.amountDelivered,
+        slot: maxSlot.slot,
+        userName: maxSlot.order.userName
+      }
+    : null
+
+  return {
+    ts: nowIso,
+    productKey,
+    productName,
+    page,
+    max,
+    slots
+  }
+}
+
+function recordPageSnapshot (snapshot) {
+  if (!snapshot) return
+  try {
+    fs.appendFileSync(ordersLogPath, JSON.stringify(snapshot) + '\n', 'utf8')
+    const size = fs.statSync(ordersLogPath).size
+    console.log(`Snapshot saved (${size} bytes)`)
+  } catch (err) {
+    console.warn('Failed to write orders log:', err && err.message ? err.message : err)
+  }
+}
+

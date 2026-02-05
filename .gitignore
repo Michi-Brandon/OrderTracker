@@ -11,3 +11,29 @@ test/server_*
 .DS_Store
 launcher_accounts.json
 data
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Env / secrets
+.env
+.env.* 
+*.key
+*.pem
+
+# Local data / logs
+orders-snapshots.jsonl
+orders-log.jsonl
+orders-tracked.json
+orders-aliases.json
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

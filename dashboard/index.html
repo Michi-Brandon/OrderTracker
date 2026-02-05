@@ -1,0 +1,121 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Orders Dashboard</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <aside id="sidebar">
+        <div class="brand">
+          <div class="title">Orders</div>
+          <div class="subtitle">First page snapshots</div>
+        </div>
+
+        <div class="sidebar-section" data-section="find">
+          <button class="section-header" type="button">
+            <span class="section-title">Find Item</span>
+            <span class="section-toggle" aria-hidden="true">▾</span>
+          </button>
+          <div class="section-body">
+            <label class="search">
+              <input id="search" type="text" placeholder="Redstone, Repeater..." />
+            </label>
+            <div id="resultList" class="result-list"></div>
+          </div>
+        </div>
+
+        <div class="sidebar-section" data-section="tracking">
+          <button class="section-header" type="button">
+            <span class="section-title">Tracking</span>
+            <span class="section-toggle" aria-hidden="true">▾</span>
+          </button>
+          <div class="section-body">
+            <div id="selectedProductLabel" class="meta"></div>
+            <button id="trackButton" class="track-btn" disabled>Trackear</button>
+            <div class="alias-row">
+              <input id="trackAliasInput" class="alias-input" placeholder="orders query" />
+            </div>
+            <div id="trackedList" class="tracked-list"></div>
+          </div>
+        </div>
+
+        <div class="sidebar-section" data-section="snapshot">
+          <button class="section-header" type="button">
+            <span class="section-title">Snapshot</span>
+            <span class="section-toggle" aria-hidden="true">▾</span>
+          </button>
+          <div class="section-body">
+            <div id="snapshotMeta" class="meta"></div>
+          </div>
+        </div>
+
+        <div class="sidebar-section" data-section="chat">
+          <button class="section-header" type="button">
+            <span class="section-title">Chat</span>
+            <span class="section-toggle" aria-hidden="true">▾</span>
+          </button>
+          <div class="section-body">
+            <div class="meta">Send after current tasks finish</div>
+            <div class="alias-row">
+              <input id="chatMessageInput" class="alias-input" placeholder="Type a message..." />
+            </div>
+            <button id="chatSendButton" class="track-btn" disabled>Send Once</button>
+          </div>
+        </div>
+      </aside>
+
+      <main id="main">
+        <div class="product-header">
+          <div>
+            <div id="productTitle" class="product-title">Product: —</div>
+            <div id="productSubtitle" class="product-subtitle">Latest snapshot: —</div>
+          </div>
+        </div>
+        <div class="panel-grid">
+          <section class="panel panel-half">
+            <div class="panel-header">
+              <div>
+                <div class="panel-title">Max Price Over Time</div>
+                <div class="panel-subtitle">Hover a point to view the full page</div>
+              </div>
+              <div class="panel-actions">
+                <div id="rangeControls" class="range-controls"></div>
+                <div id="chartLegend" class="legend"></div>
+              </div>
+            </div>
+            <div class="chart-wrap">
+              <canvas id="chart"></canvas>
+              <div id="tooltip" class="tooltip" hidden></div>
+            </div>
+          </section>
+
+          <section class="panel panel-half craft-panel">
+            <div class="panel-header">
+              <div>
+                <div class="panel-title">Crafteo</div>
+                <div class="panel-subtitle">Recipe breakdown and margin</div>
+              </div>
+            </div>
+            <div id="craftSummary" class="craft-summary"></div>
+            <div id="craftList" class="craft-list"></div>
+          </section>
+        </div>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <div class="panel-title">Orders Page View</div>
+              <div id="gridMeta" class="panel-subtitle"></div>
+            </div>
+          </div>
+          <div id="grid" class="grid"></div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
