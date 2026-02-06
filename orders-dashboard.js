@@ -6,6 +6,7 @@ const MinecraftData = require('minecraft-data')
 const port = Number(process.env.DASHBOARD_PORT || 3008)
 const mcVersion = process.env.MC_VERSION || '1.20.2'
 const dataPath = path.join(__dirname, 'orders-snapshots.jsonl')
+const allDataPath = path.join(__dirname, 'orders-all.jsonl')
 const publicDir = path.join(__dirname, 'dashboard')
 const textureRoot = path.join(__dirname, 'node_modules', 'prismarine-viewer', 'public', 'textures', '1.20.1', 'items')
 const blockTextureRoot = path.join(__dirname, 'node_modules', 'prismarine-viewer', 'public', 'textures', '1.20.1', 'blocks')
@@ -102,6 +103,22 @@ function readSnapshots () {
   return snapshots
 }
 
+function readAllPages () {
+  if (!fs.existsSync(allDataPath)) return []
+  const raw = fs.readFileSync(allDataPath, 'utf8')
+  const lines = raw.split(/\r?\n/).filter((line) => line.trim() !== '')
+  const pages = []
+  for (const line of lines) {
+    try {
+      pages.push(JSON.parse(line))
+    } catch (err) {
+      // ignore bad lines
+    }
+  }
+  pages.sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime())
+  return pages
+}
+
 function sendJson (res, status, payload) {
   const body = JSON.stringify(payload)
   res.writeHead(status, {
@@ -129,6 +146,12 @@ const server = http.createServer((req, res) => {
   if (url.pathname === '/api/snapshots') {
     const snapshots = readSnapshots()
     sendJson(res, 200, snapshots)
+    return
+  }
+
+  if (url.pathname === '/api/all') {
+    const pages = readAllPages()
+    sendJson(res, 200, pages)
     return
   }
 

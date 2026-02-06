@@ -19,6 +19,22 @@ const craftList = document.getElementById('craftList')
 const trackAliasInput = document.getElementById('trackAliasInput')
 const chatMessageInput = document.getElementById('chatMessageInput')
 const chatSendButton = document.getElementById('chatSendButton')
+const chartModeControls = document.getElementById('chartModeControls')
+const searchAllButton = document.getElementById('searchAllButton')
+const searchAllStatus = document.getElementById('searchAllStatus')
+const snapshotPanel = document.getElementById('snapshotPanel')
+const groupedPanel = document.getElementById('groupedPanel')
+const groupedList = document.getElementById('groupedList')
+const groupedMeta = document.getElementById('groupedMeta')
+const productView = document.getElementById('productView')
+const marginsView = document.getElementById('marginsView')
+const marginsHoursInput = document.getElementById('marginsHours')
+const marginsList = document.getElementById('marginsList')
+const tabs = Array.from(document.querySelectorAll('.tab-button'))
+const alertsWebhookInput = document.getElementById('alertsWebhook')
+const alertsList = document.getElementById('alertsList')
+const addAlertButton = document.getElementById('addAlertButton')
+const itemsDatalist = document.getElementById('itemsDatalist')
 
 let snapshots = []
 let chartPoints = []
@@ -34,6 +50,13 @@ let trackedKeys = new Set()
 let trackedItems = []
 let activeRecipe = null
 let aliasMap = new Map()
+let chartMode = 'snapshot'
+let allPages = []
+let groupedRuns = []
+let latestGroupedRun = null
+let marginsHours = 24
+let alertsConfig = { webhookUrl: '', rules: [] }
+let recipeCache = new Map()
 
 function formatPrice (value) {
   if (value >= 1_000_000_000) return `$${(value / 1_000_000_000).toFixed(1)}B`
@@ -230,6 +253,117 @@ function getFilteredSnapshots () {
   return filtered
 }
 
+function pickBestOrder (orders) {
+  if (!orders || orders.length === 0) return null
+  let best = null
+  for (const order of orders) {
+    const remaining = Math.max((order.amountOrdered || 0) - (order.amountDelivered || 0), 0)
+    const score = (order.price || 0) * Math.max(remaining, 1)
+    if (!best || score > best.score) {
+      best = {
+        price: order.price || 0,
+        amountOrdered: order.amountOrdered || 0,
+        amountDelivered: order.amountDelivered || 0,
+        remaining,
+        userName: order.userName || '',
+        score
+      }
+    }
+  }
+  return best
+}
+
+function buildGroupedRuns () {
+  const runsMap = new Map()
+  for (const page of allPages || []) {
+    if (!page || !page.ts) continue
+    const runId = page.runId || page.runTs || page.ts
+    const runTs = page.runTs || page.ts
+    if (!runId) continue
+    const run = runsMap.get(runId) || {
+      runId,
+      ts: runTs,
+      items: new Map(),
+      pages: 0
+    }
+    run.pages += 1
+    if (runTs && new Date(runTs).getTime() > new Date(run.ts).getTime()) {
+      run.ts = runTs
+    }
+
+    const slots = page.slots || []
+    for (const slot of slots) {
+      if (!slot?.order || !slot?.item) continue
+      const key = slot.item.name || getItemKey(slot.item)
+      if (!key) continue
+      const entry = run.items.get(key) || {
+        key,
+        name: slot.item.displayName || slot.item.name || key,
+        orders: []
+      }
+      entry.orders.push({
+        price: slot.order.price,
+        amountOrdered: slot.order.amountOrdered,
+        amountDelivered: slot.order.amountDelivered,
+        userName: slot.order.userName
+      })
+      run.items.set(key, entry)
+    }
+
+    runsMap.set(runId, run)
+  }
+
+  const runs = Array.from(runsMap.values())
+  for (const run of runs) {
+    for (const entry of run.items.values()) {
+      entry.best = pickBestOrder(entry.orders)
+      entry.ordersCount = entry.orders.length
+      entry.remainingTotal = entry.orders.reduce((sum, o) => {
+        const remaining = Math.max((o.amountOrdered || 0) - (o.amountDelivered || 0), 0)
+        return sum + remaining
+      }, 0)
+    }
+  }
+
+  runs.sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime())
+  groupedRuns = runs
+  latestGroupedRun = runs.length > 0 ? runs[runs.length - 1] : null
+}
+
+function getGroupedSeries () {
+  if (!selectedProduct?.key) return []
+  const key = selectedProduct.key
+  const series = []
+  for (const run of groupedRuns || []) {
+    const entry = run.items.get(key)
+    if (!entry || !entry.best) continue
+    series.push({
+      ts: run.ts,
+      runId: run.runId,
+      grouped: true,
+      productKey: key,
+      productName: entry.name,
+      max: {
+        price: entry.best.price,
+        amountOrdered: entry.best.amountOrdered,
+        amountDelivered: entry.best.amountDelivered,
+        remaining: entry.best.remaining,
+        userName: entry.best.userName
+      }
+    })
+  }
+  return series
+}
+
+function getFilteredGroupedSeries () {
+  let series = getGroupedSeries()
+  if (timeRangeMs) {
+    const cutoff = Date.now() - timeRangeMs
+    series = series.filter((snap) => new Date(snap.ts).getTime() >= cutoff)
+  }
+  return series
+}
+
 function setSelectedProduct (item) {
   if (!item) return
   selectedProduct = {
@@ -251,14 +385,17 @@ function setSelectedProduct (item) {
   renderActiveSnapshot()
 }
 
-function updateProductLabels (snapshot = null) {
+function updateProductLabels (snapshot = null, options = {}) {
   const name = selectedProduct?.name || '—'
   productTitle.textContent = `Product: ${name}`
 
+  const mode = options.mode || chartMode
   if (snapshot) {
-    productSubtitle.textContent = `Latest snapshot: ${new Date(snapshot.ts).toLocaleString()}`
+    const label = mode === 'grouped' ? 'Latest grouped scan' : 'Latest snapshot'
+    productSubtitle.textContent = `${label}: ${new Date(snapshot.ts).toLocaleString()}`
   } else {
-    productSubtitle.textContent = 'Latest snapshot: —'
+    const label = mode === 'grouped' ? 'Latest grouped scan' : 'Latest snapshot'
+    productSubtitle.textContent = `${label}: —`
   }
 
   selectedProductLabel.textContent = selectedProduct
@@ -395,6 +532,50 @@ function renderRangeControls () {
     rangeControls.appendChild(button)
   }
 }
+
+function renderChartModeControls () {
+  if (!chartModeControls) return
+  chartModeControls.innerHTML = ''
+  const modes = [
+    { label: 'Snapshot', value: 'snapshot' },
+    { label: 'Grouped', value: 'grouped' }
+  ]
+  for (const mode of modes) {
+    const button = document.createElement('button')
+    button.textContent = mode.label
+    if (chartMode === mode.value) button.classList.add('active')
+    button.addEventListener('click', () => {
+      setChartMode(mode.value)
+    })
+    chartModeControls.appendChild(button)
+  }
+}
+
+function setChartMode (mode) {
+  chartMode = mode
+  activeSnapshotLocked = false
+  renderChartModeControls()
+  renderChart()
+  renderActiveSnapshot()
+  renderCraftSection()
+  renderGroupedSummary()
+  renderMargins()
+  if (snapshotPanel && groupedPanel) {
+    snapshotPanel.hidden = chartMode === 'grouped'
+    groupedPanel.hidden = chartMode !== 'grouped'
+  }
+}
+
+function setActiveTab (tab) {
+  for (const button of tabs) {
+    button.classList.toggle('active', button.dataset.tab === tab)
+  }
+  if (productView) productView.hidden = tab !== 'product'
+  if (marginsView) marginsView.hidden = tab !== 'margins'
+  if (tab === 'margins') {
+    renderMargins()
+  }
+}
 async function trackSelectedProduct () {
   if (!selectedProduct?.key) return
 
@@ -428,6 +609,7 @@ async function toggleTrack (productKey, commandName) {
 
 
 function getMaxSlot (snapshot, keyOverride = null) {
+  if (snapshot?.grouped && snapshot?.max && snapshot.max.price != null) return snapshot.max
   if (!keyOverride && !selectedProduct?.key && snapshot?.max && snapshot.max.price != null) return snapshot.max
   const key = keyOverride || selectedProduct?.key
   const orderSlots = (snapshot?.slots || []).filter((slot) => slot.order && slotMatchesKey(slot, key))
@@ -450,6 +632,11 @@ async function loadItemsCatalog () {
     const res = await fetch('/api/items')
     const data = await res.json()
     itemsCatalog = Array.isArray(data) ? data : []
+    if (itemsDatalist) {
+      itemsDatalist.innerHTML = itemsCatalog
+        .map((item) => `<option value="${item.name}">${item.displayName}</option>`)
+        .join('')
+    }
   } catch (err) {
     console.error(err)
     itemsCatalog = []
@@ -526,17 +713,29 @@ function renderCraftSection () {
   const latestMap = getLatestSnapshotMap()
   const resultCount = activeRecipe.result?.count || 1
 
-  const productSnapshot = activeSnapshot
-  const productMax = productSnapshot ? getMaxSlot(productSnapshot, selectedProduct?.key) : null
-  const productUnitPrice = productMax?.price ?? null
+  let productUnitPrice = null
+  if (chartMode === 'grouped') {
+    const groupedItem = latestGroupedRun?.items?.get(selectedProduct?.key)
+    productUnitPrice = groupedItem?.best?.price ?? null
+  } else {
+    const productSnapshot = activeSnapshot
+    const productMax = productSnapshot ? getMaxSlot(productSnapshot, selectedProduct?.key) : null
+    productUnitPrice = productMax?.price ?? null
+  }
 
   let craftCost = 0
   let craftCostKnown = true
 
   for (const ingredient of activeRecipe.ingredients) {
-    const latest = latestMap.get(ingredient.name)
-    const max = latest ? getMaxSlot(latest, ingredient.name) : null
-    const unitPrice = max?.price ?? null
+    let unitPrice = null
+    if (chartMode === 'grouped') {
+      const groupedItem = latestGroupedRun?.items?.get(ingredient.name)
+      unitPrice = groupedItem?.best?.price ?? null
+    } else {
+      const latest = latestMap.get(ingredient.name)
+      const max = latest ? getMaxSlot(latest, ingredient.name) : null
+      unitPrice = max?.price ?? null
+    }
     const qtyPerUnit = ingredient.count / resultCount
     if (unitPrice == null) {
       craftCostKnown = false
@@ -577,9 +776,15 @@ function renderCraftSection () {
   craftSummary.appendChild(marginMetric)
 
   for (const ingredient of activeRecipe.ingredients) {
-    const latest = latestMap.get(ingredient.name)
-    const max = latest ? getMaxSlot(latest, ingredient.name) : null
-    const unitPrice = max?.price ?? null
+    let unitPrice = null
+    if (chartMode === 'grouped') {
+      const groupedItem = latestGroupedRun?.items?.get(ingredient.name)
+      unitPrice = groupedItem?.best?.price ?? null
+    } else {
+      const latest = latestMap.get(ingredient.name)
+      const max = latest ? getMaxSlot(latest, ingredient.name) : null
+      unitPrice = max?.price ?? null
+    }
     const qtyPerUnit = ingredient.count / resultCount
     const totalCost = unitPrice != null ? unitPrice * qtyPerUnit : null
     const item = itemsCatalog.find((i) => i.name === ingredient.name)
@@ -597,13 +802,13 @@ function renderCraftSection () {
           <div class="item-actions">
             <button class="${isTracked ? 'tracking' : ''}">${isTracked ? 'Tracking' : 'Track'}</button>
             <input class="alias-input craft-alias" value="${aliasValue}" placeholder="orders query" />
+            <div class="metrics">
+              <strong>${qtyPerUnit % 1 === 0 ? qtyPerUnit : qtyPerUnit.toFixed(2)}x</strong>
+              <div>Unit: ${unitPrice != null ? formatPrice(unitPrice) : 'n/a'}</div>
+              <div>${totalCost != null ? formatPrice(Math.round(totalCost)) : 'n/a'}</div>
+            </div>
           </div>
         </div>
-      </div>
-      <div class="metrics">
-        <strong>${qtyPerUnit % 1 === 0 ? qtyPerUnit : qtyPerUnit.toFixed(2)}x</strong>
-        <div>Unit: ${unitPrice != null ? formatPrice(unitPrice) : 'n/a'}</div>
-        <div>${totalCost != null ? formatPrice(Math.round(totalCost)) : 'n/a'}</div>
       </div>
     `
 
@@ -665,6 +870,264 @@ async function loadQueueState () {
   }
 }
 
+async function loadAllPages () {
+  try {
+    const res = await fetch('/api/all')
+    const data = await res.json()
+    allPages = Array.isArray(data) ? data : []
+    buildGroupedRuns()
+    renderGroupedSummary()
+    if (chartMode === 'grouped') {
+      renderChart()
+      renderActiveSnapshot()
+      renderCraftSection()
+    }
+    renderMargins()
+  } catch (err) {
+    console.error(err)
+    allPages = []
+    groupedRuns = []
+    latestGroupedRun = null
+    renderGroupedSummary()
+    renderMargins()
+  }
+}
+
+async function loadSearchAllStatus () {
+  if (!searchAllStatus) return
+  try {
+    const res = await fetch(`${botApiBase}/search-all`)
+    if (!res.ok) throw new Error('Search-all unavailable')
+    const data = await res.json()
+    const last = data.lastRunTs ? new Date(data.lastRunTs).toLocaleString() : '—'
+    searchAllStatus.textContent = data.running ? 'Scanning…' : `Last scan: ${last}`
+    if (searchAllButton) {
+      searchAllButton.disabled = Boolean(data.running)
+    }
+  } catch (err) {
+    searchAllStatus.textContent = 'Search-all unavailable'
+  }
+}
+
+async function triggerSearchAll () {
+  if (!searchAllButton) return
+  searchAllButton.disabled = true
+  try {
+    const res = await fetch(`${botApiBase}/search-all`, { method: 'POST' })
+    if (res.ok) {
+      await loadSearchAllStatus()
+    }
+  } catch (err) {
+    console.error(err)
+  } finally {
+    setTimeout(() => loadSearchAllStatus(), 1500)
+  }
+}
+
+function renderGroupedSummary () {
+  if (!groupedList || !groupedMeta) return
+  groupedList.innerHTML = ''
+  if (!latestGroupedRun) {
+    groupedMeta.textContent = 'No grouped scans yet. Run "Search all orders".'
+    groupedList.innerHTML = '<div class="meta">No grouped data.</div>'
+    return
+  }
+
+  groupedMeta.textContent = `Last scan: ${new Date(latestGroupedRun.ts).toLocaleString()} • Pages: ${latestGroupedRun.pages}`
+  const items = Array.from(latestGroupedRun.items.values()).filter((entry) => entry.best)
+  items.sort((a, b) => (b.best?.score || 0) - (a.best?.score || 0))
+
+  for (const entry of items) {
+    const catalogItem = itemsCatalog.find((item) => item.name === entry.key)
+    const displayName = catalogItem?.displayName || entry.name || entry.key
+    const remaining = entry.best.remaining
+    const row = document.createElement('div')
+    row.className = 'grouped-item'
+    row.innerHTML = `
+      <div class="item-thumb"><img src="${itemIconUrl({ name: entry.key })}" alt="" /></div>
+      <div>
+        <div class="item-name">${displayName}</div>
+        <div class="item-meta">Remaining: ${formatNumber(remaining)} • Orders: ${entry.ordersCount}</div>
+      </div>
+      <div class="item-price">${formatPrice(entry.best.price)}</div>
+    `
+    row.addEventListener('click', () => {
+      setSelectedProduct({ name: entry.key, displayName })
+      setChartMode('grouped')
+    })
+    groupedList.appendChild(row)
+  }
+}
+
+async function loadAlertsConfig () {
+  if (!alertsWebhookInput || !alertsList) return
+  try {
+    const res = await fetch(`${botApiBase}/alerts`)
+    if (!res.ok) throw new Error('Alerts unavailable')
+    const data = await res.json()
+    alertsConfig = {
+      webhookUrl: data.webhookUrl || '',
+      rules: Array.isArray(data.rules) ? data.rules : []
+    }
+    alertsWebhookInput.value = alertsConfig.webhookUrl || ''
+    renderAlerts()
+  } catch (err) {
+    console.error(err)
+  }
+}
+
+async function saveAlertsConfig () {
+  try {
+    await fetch(`${botApiBase}/alerts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(alertsConfig)
+    })
+  } catch (err) {
+    console.error(err)
+  }
+}
+
+function renderAlerts () {
+  if (!alertsList) return
+  alertsList.innerHTML = ''
+  const rules = Array.isArray(alertsConfig.rules) ? alertsConfig.rules : []
+  for (const rule of rules) {
+    const row = document.createElement('div')
+    row.className = 'alert-row'
+    row.dataset.id = rule.id
+    row.innerHTML = `
+      <input class="alert-item" list="itemsDatalist" placeholder="item key" value="${rule.productKey || ''}" />
+      <input class="alert-min" type="number" placeholder="Min $" value="${rule.priceMin ?? ''}" />
+      <input class="alert-max" type="number" placeholder="Max $" value="${rule.priceMax ?? ''}" />
+      <input class="alert-qty-min" type="number" placeholder="Min qty" value="${rule.qtyMin ?? ''}" />
+      <input class="alert-qty-max" type="number" placeholder="Max qty" value="${rule.qtyMax ?? ''}" />
+      <button class="alert-remove" type="button">✕</button>
+    `
+    const inputs = row.querySelectorAll('input')
+    inputs.forEach((input) => {
+      input.addEventListener('change', () => {
+        rule.productKey = row.querySelector('.alert-item').value.trim()
+        rule.priceMin = row.querySelector('.alert-min').value.trim()
+        rule.priceMax = row.querySelector('.alert-max').value.trim()
+        rule.qtyMin = row.querySelector('.alert-qty-min').value.trim()
+        rule.qtyMax = row.querySelector('.alert-qty-max').value.trim()
+        saveAlertsConfig()
+      })
+    })
+    const removeBtn = row.querySelector('.alert-remove')
+    if (removeBtn) {
+      removeBtn.addEventListener('click', () => {
+        alertsConfig.rules = alertsConfig.rules.filter((r) => r.id !== rule.id)
+        renderAlerts()
+        saveAlertsConfig()
+      })
+    }
+    alertsList.appendChild(row)
+  }
+}
+
+async function fetchRecipeCached (itemKey) {
+  if (!itemKey) return null
+  if (recipeCache.has(itemKey)) return recipeCache.get(itemKey)
+  const promise = fetch(`/api/recipe?item=${encodeURIComponent(itemKey)}`)
+    .then((res) => res.json())
+    .then((data) => (data && data.ingredients ? data : null))
+    .catch(() => null)
+  recipeCache.set(itemKey, promise)
+  return promise
+}
+
+function averageGroupedPrice (productKey, sinceMs) {
+  if (!productKey) return null
+  const cutoff = Date.now() - sinceMs
+  let total = 0
+  let count = 0
+  for (const run of groupedRuns) {
+    if (new Date(run.ts).getTime() < cutoff) continue
+    const entry = run.items.get(productKey)
+    if (!entry?.best?.price) continue
+    total += entry.best.price
+    count += 1
+  }
+  return count > 0 ? total / count : null
+}
+
+async function renderMargins () {
+  if (!marginsList) return
+  marginsList.innerHTML = '<div class="meta">Loading margins…</div>'
+  const run = latestGroupedRun
+  if (!run) {
+    marginsList.innerHTML = '<div class="meta">Run a grouped scan to calculate margins.</div>'
+    return
+  }
+
+  const hours = Number(marginsHours) || 24
+  const sinceMs = hours * 60 * 60 * 1000
+  const candidates = Array.from(run.items.values())
+
+  const rows = []
+  for (const entry of candidates) {
+    const avgPrice = averageGroupedPrice(entry.key, sinceMs)
+    if (!avgPrice) continue
+    const recipe = await fetchRecipeCached(entry.key)
+    if (!recipe || !recipe.ingredients || recipe.ingredients.length === 0) continue
+
+    let craftCost = 0
+    let craftKnown = true
+    const resultCount = recipe.result?.count || 1
+    for (const ingredient of recipe.ingredients) {
+      const avgIngredientPrice = averageGroupedPrice(ingredient.name, sinceMs)
+      if (avgIngredientPrice == null) {
+        craftKnown = false
+        break
+      }
+      const qtyPerUnit = ingredient.count / resultCount
+      craftCost += avgIngredientPrice * qtyPerUnit
+    }
+    if (!craftKnown) continue
+    const margin = avgPrice - craftCost
+    rows.push({
+      key: entry.key,
+      name: entry.name,
+      avgPrice,
+      craftCost,
+      margin
+    })
+  }
+
+  rows.sort((a, b) => b.margin - a.margin)
+  marginsList.innerHTML = ''
+
+  if (rows.length === 0) {
+    marginsList.innerHTML = '<div class="meta">No margins available for this window.</div>'
+    return
+  }
+
+  for (const row of rows.slice(0, 50)) {
+    const catalogItem = itemsCatalog.find((item) => item.name === row.key)
+    const displayName = catalogItem?.displayName || row.name || row.key
+    const node = document.createElement('div')
+    node.className = 'margin-row'
+    node.innerHTML = `
+      <div class="item-thumb"><img src="${itemIconUrl({ name: row.key })}" alt="" /></div>
+      <div>
+        <div class="item-name">${displayName}</div>
+        <div class="meta">Avg price (last ${hours}h)</div>
+      </div>
+      <div class="metric">${formatPrice(Math.round(row.avgPrice))}</div>
+      <div class="metric">${formatPrice(Math.round(row.craftCost))}</div>
+      <div class="metric">${row.margin >= 0 ? '+' : '-'}${formatPrice(Math.round(Math.abs(row.margin)))}</div>
+    `
+    node.addEventListener('click', () => {
+      setSelectedProduct({ name: row.key, displayName })
+      setActiveTab('product')
+      setChartMode('grouped')
+    })
+    marginsList.appendChild(node)
+  }
+}
+
 function renderChart () {
   const dpr = window.devicePixelRatio || 1
   const rect = chart.getBoundingClientRect()
@@ -675,12 +1138,12 @@ function renderChart () {
 
   ctx.clearRect(0, 0, rect.width, rect.height)
 
-  chartSnapshots = getFilteredSnapshots()
+  chartSnapshots = chartMode === 'grouped' ? getFilteredGroupedSeries() : getFilteredSnapshots()
 
   if (chartSnapshots.length === 0) {
     ctx.fillStyle = '#666'
     ctx.font = '14px Space Grotesk, sans-serif'
-    ctx.fillText('No snapshots in this range', 12, 30)
+    ctx.fillText(chartMode === 'grouped' ? 'No grouped scans in this range' : 'No snapshots in this range', 12, 30)
     chartPoints = []
     chartLegend.textContent = 'Latest: no data'
     return
@@ -689,7 +1152,8 @@ function renderChart () {
   const padding = { left: 60, right: 20, top: 24, bottom: 36 }
   const width = rect.width - padding.left - padding.right
   const height = rect.height - padding.top - padding.bottom
-  const prices = chartSnapshots.map((s) => getMaxSlot(s)?.price || 0)
+  const maxSlots = chartSnapshots.map((s) => getMaxSlot(s))
+  const prices = maxSlots.map((max) => max?.price || 0)
   const maxPrice = Math.max(...prices, 1)
 
   chartPoints = chartSnapshots.map((snap, idx) => {
@@ -745,6 +1209,57 @@ function renderChart () {
     ctx.fill()
   })
 
+  const stats = (() => {
+    if (prices.length === 0) return null
+    const mean = prices.reduce((sum, v) => sum + v, 0) / prices.length
+    const variance = prices.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / prices.length
+    const std = Math.sqrt(variance)
+    return { mean, std }
+  })()
+
+  if (stats && stats.std > 0) {
+    const threshold = stats.mean + stats.std * 2
+    ctx.font = '11px Space Grotesk, sans-serif'
+    ctx.fillStyle = '#1f2933'
+    ctx.strokeStyle = 'rgba(31,41,51,0.2)'
+
+    chartPoints.forEach((pt, idx) => {
+      const price = prices[idx]
+      if (price < threshold) return
+      const max = maxSlots[idx]
+      if (!max) return
+      const paid = Number.isFinite(max.amountDelivered) ? max.amountDelivered * price : null
+      const total = Number.isFinite(max.amountOrdered) ? max.amountOrdered * price : null
+      const lines = [
+        `Unit ${formatPrice(price)}`,
+        `Paid ${paid != null ? formatPrice(paid) : 'n/a'}`,
+        `Total ${total != null ? formatPrice(total) : 'n/a'}`
+      ]
+
+      const lineHeight = 13
+      const paddingX = 6
+      const paddingY = 4
+      const textWidth = Math.max(...lines.map((line) => ctx.measureText(line).width))
+      const boxWidth = textWidth + paddingX * 2
+      const boxHeight = lines.length * lineHeight + paddingY * 2
+      let boxX = pt.x + 8
+      let boxY = pt.y - boxHeight - 8
+
+      if (boxX + boxWidth > rect.width - 8) {
+        boxX = pt.x - boxWidth - 8
+      }
+      if (boxX < 8) boxX = 8
+      if (boxY < 8) boxY = pt.y + 8
+
+      ctx.fillStyle = 'rgba(31, 41, 51, 0.88)'
+      ctx.fillRect(boxX, boxY, boxWidth, boxHeight)
+      ctx.fillStyle = '#fff'
+      lines.forEach((line, i) => {
+        ctx.fillText(line, boxX + paddingX, boxY + paddingY + (i + 1) * lineHeight - 3)
+      })
+    })
+  }
+
   if (hoverIndex != null) {
     const pt = chartPoints.find((p) => p.idx === hoverIndex)
     if (pt) {
@@ -757,12 +1272,68 @@ function renderChart () {
 
   const last = chartSnapshots[chartSnapshots.length - 1]
   const lastMax = getMaxSlot(last)
-  chartLegend.textContent = lastMax
-    ? `Latest: ${formatPrice(lastMax.price)} (${formatNumber(lastMax.amountDelivered)}/${formatNumber(lastMax.amountOrdered)} delivered)`
-    : 'Latest: no data'
+  if (lastMax) {
+    const hasNumbers = Number.isFinite(lastMax.amountOrdered) && Number.isFinite(lastMax.amountDelivered)
+    const remaining = hasNumbers ? lastMax.amountOrdered - lastMax.amountDelivered : null
+    const remainingLabel = remaining != null ? formatNumber(remaining) : 'n/a'
+    const extra = hasNumbers
+      ? `${formatNumber(lastMax.amountDelivered)}/${formatNumber(lastMax.amountOrdered)} delivered`
+      : 'delivered n/a'
+    chartLegend.textContent = chartMode === 'grouped'
+      ? `Latest grouped: ${formatPrice(lastMax.price)} (remaining ${remainingLabel})`
+      : `Latest: ${formatPrice(lastMax.price)} (${extra})`
+  } else {
+    chartLegend.textContent = 'Latest: no data'
+  }
 }
 
 function renderActiveSnapshot () {
+  if (chartMode === 'grouped') {
+    const filtered = getFilteredGroupedSeries()
+    if (filtered.length === 0) {
+      snapshotMeta.innerHTML = `
+        <div><strong>Grouped scan:</strong> —</div>
+        <div><strong>Product:</strong> ${selectedProduct?.name || selectedProduct?.key || '—'}</div>
+        <div><strong>Best price:</strong> n/a</div>
+      `
+      updateProductLabels(null, { mode: 'grouped' })
+      const fallbackSnapshot = snapshots.length > 0 ? snapshots[snapshots.length - 1] : { slots: [] }
+      renderSearchResults(fallbackSnapshot)
+      renderGrid(null)
+      renderCraftSection()
+      renderGroupedSummary()
+      return
+    }
+
+    let snapshot = null
+    if (activeSnapshotLocked && activeSnapshot && activeSnapshot.grouped) {
+      snapshot = filtered.find((snap) => snap.ts === activeSnapshot.ts && snap.runId === activeSnapshot.runId)
+    }
+    if (!snapshot) {
+      snapshot = filtered[filtered.length - 1]
+      activeSnapshotLocked = false
+    }
+
+    activeSnapshot = snapshot
+    const max = getMaxSlot(snapshot)
+    const remaining = max && Number.isFinite(max.amountOrdered) && Number.isFinite(max.amountDelivered)
+      ? max.amountOrdered - max.amountDelivered
+      : null
+    snapshotMeta.innerHTML = `
+      <div><strong>Grouped scan:</strong> ${new Date(snapshot.ts).toLocaleString()}</div>
+      <div><strong>Product:</strong> ${selectedProduct?.name || snapshot.productName || snapshot.productKey}</div>
+      <div><strong>Best price:</strong> ${max ? formatPrice(max.price) : 'n/a'} ${remaining != null ? `(remaining ${formatNumber(remaining)})` : ''}</div>
+    `
+
+    updateProductLabels(snapshot, { mode: 'grouped' })
+    const fallbackSnapshot = snapshots.length > 0 ? snapshots[snapshots.length - 1] : { slots: [] }
+    renderSearchResults(fallbackSnapshot)
+    renderGrid(null)
+    renderCraftSection()
+    renderGroupedSummary()
+    return
+  }
+
   const filtered = getFilteredSnapshots()
 
   if (filtered.length === 0) {
@@ -976,11 +1547,14 @@ chart.addEventListener('mousemove', (event) => {
 
     tooltip.hidden = false
     const delivered = max ? `${formatNumber(max.amountDelivered)}/${formatNumber(max.amountOrdered)}` : 'n/a'
+    const remaining = max && Number.isFinite(max.amountOrdered) && Number.isFinite(max.amountDelivered)
+      ? formatNumber(max.amountOrdered - max.amountDelivered)
+      : 'n/a'
     const fullTime = new Date(snapshot.ts).toLocaleString()
     tooltip.innerHTML = `
       <div><strong>Time:</strong> ${fullTime}</div>
       <div><strong>Price:</strong> ${max ? formatPrice(max.price) : 'n/a'}</div>
-      <div><strong>Delivered:</strong> ${delivered}</div>
+      <div><strong>${chartMode === 'grouped' ? 'Remaining' : 'Delivered'}:</strong> ${chartMode === 'grouped' ? remaining : delivered}</div>
     `
     positionTooltip(closest.x, closest.y)
 
@@ -1036,9 +1610,15 @@ async function init () {
   await loadItemsCatalog()
   initSidebarSections()
   renderRangeControls()
+  renderChartModeControls()
   trackButton.addEventListener('click', () => {
     trackSelectedProduct()
   })
+  if (searchAllButton) {
+    searchAllButton.addEventListener('click', () => {
+      triggerSearchAll()
+    })
+  }
   if (chatMessageInput && chatSendButton) {
     const updateChatState = () => {
       chatSendButton.disabled = chatMessageInput.value.trim().length === 0
@@ -1078,10 +1658,55 @@ async function init () {
       }
     })
   }
+  if (tabs.length > 0) {
+    tabs.forEach((button) => {
+      button.addEventListener('click', () => {
+        setActiveTab(button.dataset.tab)
+      })
+    })
+    setActiveTab('product')
+  }
+  if (marginsHoursInput) {
+    const initialHours = Number(marginsHoursInput.value)
+    marginsHours = Number.isFinite(initialHours) && initialHours > 0 ? initialHours : 24
+    marginsHoursInput.addEventListener('change', () => {
+      const nextValue = Number(marginsHoursInput.value)
+      marginsHours = Number.isFinite(nextValue) && nextValue > 0 ? nextValue : 24
+      marginsHoursInput.value = marginsHours
+      renderMargins()
+    })
+  }
+  if (alertsWebhookInput) {
+    alertsWebhookInput.addEventListener('change', () => {
+      alertsConfig.webhookUrl = alertsWebhookInput.value.trim()
+      saveAlertsConfig()
+    })
+  }
+  if (addAlertButton) {
+    addAlertButton.addEventListener('click', () => {
+      const id = `alert_${Date.now()}_${Math.random().toString(16).slice(2, 6)}`
+      alertsConfig.rules = alertsConfig.rules || []
+      alertsConfig.rules.push({
+        id,
+        productKey: selectedProduct?.key || '',
+        priceMin: '',
+        priceMax: '',
+        qtyMin: '',
+        qtyMax: ''
+      })
+      renderAlerts()
+      saveAlertsConfig()
+    })
+  }
   await loadQueueState()
   await loadSnapshots()
+  await loadAllPages()
+  await loadSearchAllStatus()
+  await loadAlertsConfig()
   setInterval(loadSnapshots, 30000)
+  setInterval(loadAllPages, 60000)
   setInterval(loadQueueState, 15000)
+  setInterval(loadSearchAllStatus, 15000)
 }
 
 init()

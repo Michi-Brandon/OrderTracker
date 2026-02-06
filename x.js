@@ -51,6 +51,10 @@ const enableViewer = process.env.VIEWER !== '0'
 const enableOrders = true
 const ordersIntervalMs = Number(process.env.ORDERS_INTERVAL_MS || 60000)
 const ordersOpenTimeoutMs = Number(process.env.ORDERS_OPEN_TIMEOUT_MS || 15000)
+const searchAllOpenTimeoutMs = Number(process.env.ORDERS_SEARCH_ALL_OPEN_TIMEOUT_MS || Math.max(ordersOpenTimeoutMs * 4, 60000))
+const searchAllTimeoutMs = Number(process.env.ORDERS_SEARCH_ALL_TIMEOUT_MS || 300000)
+const searchAllRequestTimeoutMs = Number(process.env.ORDERS_SEARCH_ALL_REQUEST_TIMEOUT_MS || 600000)
+const searchAllPageDelayMs = Number(process.env.ORDERS_SEARCH_ALL_PAGE_DELAY_MS || 25000)
 const ordersCloseDelayMs = Number(process.env.ORDERS_CLOSE_DELAY_MS || 800)
 const ordersStartDelayMs = Number(process.env.ORDERS_START_DELAY_MS || 7000)
 const ordersHumanDelayMinMs = Number(process.env.ORDERS_HUMAN_DELAY_MIN_MS || 300)
@@ -62,8 +66,10 @@ const ordersProductKey = process.env.ORDERS_PRODUCT || 'repeater'
 const ordersCommandPrefix = process.env.ORDERS_CMD_PREFIX || `/orders`
 
 const ordersLogPath = path.join(__dirname, 'orders-snapshots.jsonl')
+const ordersAllLogPath = path.join(__dirname, 'orders-all.jsonl')
 const ordersAliasesPath = path.join(__dirname, 'orders-aliases.json')
 const ordersTrackedPath = path.join(__dirname, 'orders-tracked.json')
+const alertsPath = path.join(__dirname, 'orders-alerts.json')
 
 const minecraft = MinecraftData(version)
 const enchantmentDict = minecraft.enchantmentsArray.reduce((acc, e) => {
@@ -92,6 +98,15 @@ let ordersOpenTimeout = null
 let schedulerTimer = null
 let currentTask = null
 let pendingChatMessage = null
+let searchAllRequested = false
+let searchAllRunning = false
+let searchAllRunId = null
+let searchAllRunTs = null
+let searchAllLastRunTs = null
+let searchAllRequestedAt = null
+let searchAllStartedAt = null
+let alertsConfig = { webhookUrl: '', rules: [] }
+let alertLastTriggered = new Map()
 
 const trackedProducts = new Map()
 const pendingQueue = []
@@ -101,6 +116,8 @@ const trackedOrder = []
 
 loadAliases()
 loadTrackedList()
+loadAlertsConfig()
+loadSearchAllLastRun()
 
 bot.once('spawn', () => {
   console.log(`Spawned on ${host} as ${bot.username} (version ${version}, auth ${auth})`)
@@ -167,6 +184,72 @@ function loadTrackedList () {
     }
   } catch (err) {
     console.warn('Failed to load tracked list:', err && err.message ? err.message : err)
+  }
+}
+
+function loadAlertsConfig () {
+  try {
+    if (!fs.existsSync(alertsPath)) return
+    const raw = fs.readFileSync(alertsPath, 'utf8')
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object') return
+    const webhookUrl = typeof parsed.webhookUrl === 'string' ? parsed.webhookUrl.trim() : ''
+    const rules = Array.isArray(parsed.rules) ? parsed.rules.map(normalizeAlertRule).filter(Boolean) : []
+    alertsConfig = { webhookUrl, rules }
+  } catch (err) {
+    console.warn('Failed to load alerts config:', err && err.message ? err.message : err)
+  }
+}
+
+function loadSearchAllLastRun () {
+  try {
+    if (!fs.existsSync(ordersAllLogPath)) return
+    const raw = fs.readFileSync(ordersAllLogPath, 'utf8')
+    const lines = raw.split(/\r?\n/).filter((line) => line.trim() !== '')
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      try {
+        const entry = JSON.parse(lines[i])
+        const ts = entry.runTs || entry.ts
+        if (ts) {
+          searchAllLastRunTs = ts
+          break
+        }
+      } catch (err) {
+        // ignore
+      }
+    }
+  } catch (err) {
+    console.warn('Failed to load last search-all timestamp:', err && err.message ? err.message : err)
+  }
+}
+
+function saveAlertsConfig () {
+  try {
+    fs.writeFileSync(alertsPath, JSON.stringify(alertsConfig, null, 2), 'utf8')
+  } catch (err) {
+    console.warn('Failed to save alerts config:', err && err.message ? err.message : err)
+  }
+}
+
+function normalizeAlertRule (rule) {
+  if (!rule || typeof rule !== 'object') return null
+  const productKey = normalizeProductKey(rule.productKey || rule.product || rule.item || '')
+  if (!productKey) return null
+  const id = typeof rule.id === 'string' && rule.id.trim()
+    ? rule.id.trim()
+    : `alert_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`
+  const toNumber = (value) => {
+    if (value == null || value === '') return null
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  return {
+    id,
+    productKey,
+    priceMin: toNumber(rule.priceMin),
+    priceMax: toNumber(rule.priceMax),
+    qtyMin: toNumber(rule.qtyMin),
+    qtyMax: toNumber(rule.qtyMax)
   }
 }
 
@@ -299,6 +382,7 @@ function startScheduler () {
 }
 
 function schedulerTick () {
+  if (searchAllRunning || searchAllRequested) return
   const now = Date.now()
   for (const key of trackedOrder) {
     const entry = trackedProducts.get(key)
@@ -316,6 +400,16 @@ function schedulerTick () {
 function processQueue () {
   if (!enableOrders) return
   if (currentTask || ordersInFlight) return
+  if (searchAllRequested && !searchAllRunning) {
+    if (searchAllRequestedAt && Date.now() - searchAllRequestedAt > searchAllRequestTimeoutMs) {
+      console.warn('Search all request timed out; clearing request.')
+      searchAllRequested = false
+      searchAllRequestedAt = null
+      return
+    }
+    startSearchAll()
+    return
+  }
   if (pendingQueue.length === 0) return
 
   const productKey = pendingQueue.shift()
@@ -351,6 +445,219 @@ function issueOrdersCommand (productKey) {
       finishCurrentTask()
     }
   }, ordersOpenTimeoutMs)
+}
+
+function startSearchAll () {
+  if (searchAllRunning) return
+  searchAllRequested = false
+  searchAllRequestedAt = null
+  searchAllRunning = true
+  searchAllStartedAt = Date.now()
+  searchAllRunId = `run_${Date.now()}_${Math.random().toString(16).slice(2, 6)}`
+  searchAllRunTs = new Date().toISOString()
+  currentTask = { type: 'searchAll', startedAt: Date.now() }
+  ordersInFlight = true
+  expectOrdersWindow = true
+  if (ordersOpenTimeout) {
+    clearTimeout(ordersOpenTimeout)
+    ordersOpenTimeout = null
+  }
+  const command = `${ordersCommandPrefix}`.trim()
+  bot.chat(command)
+  console.log(`Search all orders started: ${command}`)
+  ordersOpenTimeout = setTimeout(() => {
+    if (searchAllRunning) {
+      console.warn('Search all window timeout; aborting.')
+      searchAllRunning = false
+      searchAllRequested = false
+      searchAllRequestedAt = null
+      searchAllStartedAt = null
+      currentTask = null
+      ordersInFlight = false
+      expectOrdersWindow = false
+      processQueue()
+    }
+  }, searchAllOpenTimeoutMs)
+}
+
+function windowSignature (window) {
+  if (!window || !Array.isArray(window.slots)) return ''
+  const limit = Math.min(window.slots.length, 54)
+  const parts = []
+  for (let i = 0; i < limit; i += 1) {
+    const item = window.slots[i]
+    if (!item) {
+      parts.push('empty')
+      continue
+    }
+    parts.push(`${item.name || 'item'}:${item.count ?? 0}:${item.displayName || item.customName || ''}`)
+  }
+  return parts.join('|')
+}
+
+function stripFormatting (value) {
+  return String(value || '').replace(/§[0-9A-FK-OR]/gi, '').trim()
+}
+
+function getSlotLabel (item) {
+  if (!item) return ''
+  return stripFormatting(item.displayName || item.customName || '')
+}
+
+function getItemLoreText (item) {
+  if (!item) return []
+  const raw = getLoreLines(item)
+  if (!raw || raw.length === 0) return []
+  return mapLoreLegacy(raw)
+    .map((line) => stripFormatting(typeof line === 'string' ? line : String(line)))
+    .filter((line) => line)
+}
+
+function slotHasNextLore (slot) {
+  if (!slot) return false
+  const lore = getItemLoreText(slot)
+  return lore.some((line) => {
+    const lowered = String(line).toLowerCase()
+    return lowered.includes('next page') || lowered.includes('next')
+  })
+}
+
+function hasNextArrow (window) {
+  if (!window || !Array.isArray(window.slots)) return false
+  const item = window.slots[53]
+  if (!item) return false
+  const name = String(item.name || '').toLowerCase()
+  const label = getSlotLabel(item).toLowerCase()
+  return name.includes('arrow') && (label.includes('next') || slotHasNextLore(item))
+}
+
+function hasNextArrowSlot (snapshotSlot, windowItem) {
+  const name = String(snapshotSlot?.item?.name || windowItem?.name || '').toLowerCase()
+  const label = String(
+    snapshotSlot?.item?.displayName ||
+    snapshotSlot?.item?.name ||
+    getSlotLabel(windowItem) ||
+    ''
+  ).toLowerCase()
+  const lore = Array.isArray(snapshotSlot?.loreText) ? snapshotSlot.loreText : getItemLoreText(windowItem)
+  const loreHasNext = lore.some((line) => stripFormatting(line).toLowerCase().includes('next'))
+  const isArrow = name.includes('arrow') || label.includes('arrow')
+  return loreHasNext && (isArrow || label.includes('next'))
+}
+
+function clickNextArrow () {
+  try {
+    bot.clickWindow(53, 0, 0)
+    return true
+  } catch (err) {
+    console.warn('Failed to click next arrow:', err && err.message ? err.message : err)
+    return false
+  }
+}
+
+function waitForWindowChange (getWindow, previousSignature, timeoutMs = 6000) {
+  const start = Date.now()
+  return new Promise((resolve) => {
+    const check = () => {
+      const win = getWindow()
+      const signature = windowSignature(win)
+      if (signature && signature !== previousSignature) {
+        resolve(true)
+        return
+      }
+      if (Date.now() - start >= timeoutMs) {
+        resolve(false)
+        return
+      }
+      setTimeout(check, 200)
+    }
+    setTimeout(check, 200)
+  })
+}
+
+function delay (ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function scanSearchAllPages (window) {
+  if (!window) return
+  const runId = searchAllRunId
+  const runTs = searchAllRunTs
+  let page = 1
+  let currentWindow = window
+  let safety = 0
+  const seenSignatures = new Set()
+
+  while (currentWindow && searchAllRunning && safety < 200) {
+    if (searchAllStartedAt && Date.now() - searchAllStartedAt > searchAllTimeoutMs) {
+      console.warn('Search all exceeded timeout; stopping.')
+      break
+    }
+    const snapshot = dumpWindowSlotsWithMeta(currentWindow, {
+      page,
+      productKey: '__all__',
+      productName: 'All Orders',
+      runId,
+      runTs,
+      mode: 'all',
+      recordTo: 'all'
+    })
+    if (snapshot) {
+      logSearchAllSnapshot(snapshot)
+    }
+    if (!snapshot) break
+    const signature = windowSignature(currentWindow)
+    if (signature) {
+      if (seenSignatures.has(signature)) {
+        console.warn('Search all detected repeated page signature; stopping to avoid loop.')
+        break
+      }
+      seenSignatures.add(signature)
+    }
+    const slot53 = snapshot?.slots ? snapshot.slots[53] : null
+    const next = hasNextArrowSlot(slot53, currentWindow?.slots ? currentWindow.slots[53] : null) || hasNextArrow(currentWindow)
+    if (!next) {
+      const slot = currentWindow?.slots ? currentWindow.slots[53] : null
+      const label = getSlotLabel(slot) || 'none'
+      const name = slot?.name || 'empty'
+      const lore = getItemLoreText(slot).join(' | ')
+      console.log(`Search all reached last page (no Next arrow). Slot53: ${name} "${label}"${lore ? ` | ${lore}` : ''}`)
+      break
+    }
+    console.log(`Search all clicking Next (page ${page})`)
+    if (!clickNextArrow()) break
+    await delay(searchAllPageDelayMs)
+    const changed = await waitForWindowChange(() => bot.currentWindow || currentWindow, signature, 6000)
+    if (!changed) {
+      console.warn('Search all page did not change after clicking Next; stopping.')
+      break
+    }
+    currentWindow = bot.currentWindow || currentWindow
+    page += 1
+    safety += 1
+  }
+
+  searchAllLastRunTs = runTs
+  finishSearchAll(currentWindow)
+}
+
+function finishSearchAll (window) {
+  searchAllRunning = false
+  searchAllRunId = null
+  searchAllRunTs = null
+  searchAllStartedAt = null
+  if (ordersOpenTimeout) {
+    clearTimeout(ordersOpenTimeout)
+    ordersOpenTimeout = null
+  }
+  if (window) {
+    closeOrdersWindow(window)
+  }
+  currentTask = null
+  ordersInFlight = false
+  expectOrdersWindow = false
+  trySendPendingChat()
+  processQueue()
 }
 
 function finishCurrentTask () {
@@ -524,6 +831,61 @@ function startOrdersApiServer () {
       return
     }
 
+    if (url.pathname === '/search-all' && req.method === 'GET') {
+      sendJson(res, 200, {
+        ok: true,
+        running: searchAllRunning,
+        runId: searchAllRunId,
+        runTs: searchAllRunTs,
+        lastRunTs: searchAllLastRunTs
+      })
+      return
+    }
+
+    if (url.pathname === '/search-all' && req.method === 'POST') {
+      if (!searchAllRunning) {
+        searchAllRequested = true
+        searchAllRequestedAt = Date.now()
+        if (!currentTask && !ordersInFlight) {
+          startSearchAll()
+        }
+      }
+      sendJson(res, 200, {
+        ok: true,
+        running: searchAllRunning,
+        runId: searchAllRunId,
+        runTs: searchAllRunTs,
+        lastRunTs: searchAllLastRunTs
+      })
+      return
+    }
+
+    if (url.pathname === '/alerts' && req.method === 'GET') {
+      sendJson(res, 200, {
+        ok: true,
+        webhookUrl: alertsConfig.webhookUrl || '',
+        rules: alertsConfig.rules || []
+      })
+      return
+    }
+
+    if (url.pathname === '/alerts' && req.method === 'POST') {
+      try {
+        const payload = await readJsonBody(req)
+        const webhookUrl = typeof payload.webhookUrl === 'string' ? payload.webhookUrl.trim() : ''
+        const rules = Array.isArray(payload.rules)
+          ? payload.rules.map(normalizeAlertRule).filter(Boolean)
+          : []
+        alertsConfig = { webhookUrl, rules }
+        saveAlertsConfig()
+        sendJson(res, 200, { ok: true })
+        return
+      } catch (err) {
+        sendJson(res, 400, { ok: false, error: 'Invalid JSON body' })
+        return
+      }
+    }
+
     sendJson(res, 404, { ok: false, error: 'Not found' })
   })
 
@@ -550,7 +912,25 @@ function closeOrdersWindow (window) {
 }
 
 bot.on('windowOpen', (window) => {
-  if (!enableOrders || !expectOrdersWindow) {
+  if (!enableOrders) {
+    return
+  }
+
+  if (searchAllRunning || currentTask?.type === 'searchAll') {
+    expectOrdersWindow = false
+    ordersInFlight = false
+    if (ordersOpenTimeout) {
+      clearTimeout(ordersOpenTimeout)
+      ordersOpenTimeout = null
+    }
+    scanSearchAllPages(window).catch((err) => {
+      console.warn('Search all failed:', err && err.message ? err.message : err)
+      finishSearchAll(window)
+    })
+    return
+  }
+
+  if (!expectOrdersWindow) {
     return
   }
 
@@ -600,7 +980,13 @@ function dumpWindowSlotsWithMeta (window, meta) {
     return null
   }
 
-  const containerSlots = getContainerSlotCount(window)
+  let containerSlots = getContainerSlotCount(window)
+  if (meta?.mode === 'all') {
+    const maxSlots = Math.min(window.slots.length, 54)
+    if (maxSlots > containerSlots) {
+      containerSlots = maxSlots
+    }
+  }
 
   const slots = []
   for (let i = 0; i < containerSlots; i += 1) {
@@ -615,10 +1001,19 @@ function dumpWindowSlotsWithMeta (window, meta) {
 
     let order = null
     let loreText = []
+    if (item) {
+      const rawLore = getLoreLines(item)
+      if (rawLore && rawLore.length > 0) {
+        loreText = mapLoreLegacy(rawLore).map((line) => (typeof line === 'string' ? line.trim() : String(line).trim()))
+      }
+    }
+
     const parsed = parseOrderFromItem(item)
     if (parsed) {
       order = parsed.order
-      loreText = parsed.loreText
+      if (parsed.loreText && parsed.loreText.length > 0) {
+        loreText = parsed.loreText
+      }
     }
 
     slots.push({
@@ -630,7 +1025,11 @@ function dumpWindowSlotsWithMeta (window, meta) {
   }
 
   const snapshot = buildOrdersSnapshot(slots, meta)
-  recordPageSnapshot(snapshot)
+  if (meta && meta.recordTo === 'all') {
+    recordAllPageSnapshot(snapshot)
+  } else {
+    recordPageSnapshot(snapshot)
+  }
   return snapshot
 }
 
@@ -837,7 +1236,7 @@ function buildOrdersSnapshot (slots, meta) {
       }
     : null
 
-  return {
+  const snapshot = {
     ts: nowIso,
     productKey,
     productName,
@@ -845,6 +1244,12 @@ function buildOrdersSnapshot (slots, meta) {
     max,
     slots
   }
+
+  if (meta?.runId) snapshot.runId = meta.runId
+  if (meta?.runTs) snapshot.runTs = meta.runTs
+  if (meta?.mode) snapshot.mode = meta.mode
+
+  return snapshot
 }
 
 function recordPageSnapshot (snapshot) {
@@ -853,8 +1258,127 @@ function recordPageSnapshot (snapshot) {
     fs.appendFileSync(ordersLogPath, JSON.stringify(snapshot) + '\n', 'utf8')
     const size = fs.statSync(ordersLogPath).size
     console.log(`Snapshot saved (${size} bytes)`)
+    evaluateAlerts(snapshot)
   } catch (err) {
     console.warn('Failed to write orders log:', err && err.message ? err.message : err)
+  }
+}
+
+function recordAllPageSnapshot (snapshot) {
+  if (!snapshot) return
+  try {
+    fs.appendFileSync(ordersAllLogPath, JSON.stringify(snapshot) + '\n', 'utf8')
+    const size = fs.statSync(ordersAllLogPath).size
+    console.log(`All-orders page saved (${size} bytes)`)
+  } catch (err) {
+    console.warn('Failed to write all-orders log:', err && err.message ? err.message : err)
+  }
+}
+
+function logSearchAllSnapshot (snapshot) {
+  if (!snapshot || !Array.isArray(snapshot.slots)) return
+  const pageLabel = snapshot.page != null ? snapshot.page : '?'
+  const header = `SearchAll page ${pageLabel} (${snapshot.ts})`
+  console.log(header)
+  let orderCount = 0
+  let controlCount = 0
+  let emptyCount = 0
+  for (const slot of snapshot.slots) {
+    if (!slot?.item) {
+      emptyCount += 1
+      continue
+    }
+    const itemName = slot.item.displayName || slot.item.name || 'unknown'
+    if (!slot.order) {
+      controlCount += 1
+      const label = slot.loreText?.join(' | ') || ''
+      console.log(`  [slot ${slot.slot}] ${itemName} ${label ? `| ${label}` : ''}`.trim())
+      continue
+    }
+    orderCount += 1
+    const user = slot.order.userName || 'unknown'
+    const price = slot.order.price ?? 0
+    const delivered = slot.order.amountDelivered ?? 0
+    const ordered = slot.order.amountOrdered ?? 0
+    const totalPaid = price * delivered
+    const totalOrder = price * ordered
+    console.log(
+      `  [slot ${slot.slot}] ${itemName} | user: ${user} | unit: ${formatPriceCompact(price)} | qty: ${formatNumberCompact(delivered)}/${formatNumberCompact(ordered)} | total: ${formatPriceCompact(totalPaid)}/${formatPriceCompact(totalOrder)}`
+    )
+  }
+  console.log(`  Slots: ${snapshot.slots.length} | orders: ${orderCount} | controls: ${controlCount} | empty: ${emptyCount}`)
+}
+
+function formatPriceCompact (value) {
+  if (!Number.isFinite(value)) return 'n/a'
+  if (value >= 1_000_000_000) return `$${(value / 1_000_000_000).toFixed(1)}B`
+  if (value >= 1_000_000) return `$${(value / 1_000_000).toFixed(1)}M`
+  if (value >= 1_000) return `$${(value / 1_000).toFixed(1)}K`
+  return `$${value}`
+}
+
+function formatNumberCompact (value) {
+  if (!Number.isFinite(value)) return 'n/a'
+  if (value >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(1)}B`
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`
+  return `${value}`
+}
+
+function evaluateAlerts (snapshot) {
+  if (!snapshot || !snapshot.productKey || !snapshot.max) return
+  if (!alertsConfig || !alertsConfig.webhookUrl || !Array.isArray(alertsConfig.rules)) return
+  const productKey = snapshot.productKey
+  const max = snapshot.max
+  const remaining = Math.max((max.amountOrdered || 0) - (max.amountDelivered || 0), 0)
+  const price = max.price
+
+  for (const rule of alertsConfig.rules) {
+    if (!rule || rule.productKey !== productKey) continue
+    if (rule.priceMin != null && price < rule.priceMin) continue
+    if (rule.priceMax != null && price > rule.priceMax) continue
+    if (rule.qtyMin != null && remaining < rule.qtyMin) continue
+    if (rule.qtyMax != null && remaining > rule.qtyMax) continue
+
+    const lastKey = `${rule.id}:${snapshot.ts}`
+    if (alertLastTriggered.has(lastKey)) continue
+    alertLastTriggered.set(lastKey, Date.now())
+
+    sendAlertWebhook({
+      productKey,
+      productName: snapshot.productName || productKey,
+      price,
+      remaining,
+      delivered: max.amountDelivered ?? 0,
+      ordered: max.amountOrdered ?? 0,
+      ts: snapshot.ts
+    })
+  }
+}
+
+async function sendAlertWebhook (payload) {
+  const webhookUrl = alertsConfig?.webhookUrl
+  if (!webhookUrl) return
+
+  const content = [
+    `Order alert: ${payload.productName}`,
+    `Price: ${formatPriceCompact(payload.price)}`,
+    `Remaining: ${formatNumberCompact(payload.remaining)} (${formatNumberCompact(payload.delivered)}/${formatNumberCompact(payload.ordered)} delivered)`,
+    `Snapshot: ${payload.ts}`
+  ].join('\n')
+
+  try {
+    if (typeof fetch === 'function') {
+      await fetch(webhookUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content })
+      })
+    } else {
+      console.warn('Fetch not available; alert not sent.')
+    }
+  } catch (err) {
+    console.warn('Failed to send alert webhook:', err && err.message ? err.message : err)
   }
 }
 

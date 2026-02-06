@@ -68,53 +68,111 @@
       </aside>
 
       <main id="main">
-        <div class="product-header">
-          <div>
-            <div id="productTitle" class="product-title">Product: —</div>
-            <div id="productSubtitle" class="product-subtitle">Latest snapshot: —</div>
-          </div>
+        <div class="main-tabs">
+          <button class="tab-button active" data-tab="product">Product</button>
+          <button class="tab-button" data-tab="margins">Margins</button>
         </div>
-        <div class="panel-grid">
-          <section class="panel panel-half">
+
+        <div id="productView">
+          <div class="product-header">
+            <div>
+              <div id="productTitle" class="product-title">Product: —</div>
+              <div id="productSubtitle" class="product-subtitle">Latest snapshot: —</div>
+            </div>
+            <div class="product-actions">
+              <button id="searchAllButton" class="secondary-btn">Search all orders</button>
+              <div id="searchAllStatus" class="meta"></div>
+            </div>
+          </div>
+          <div class="panel-grid">
+            <section class="panel panel-half">
+              <div class="panel-header">
+                <div>
+                  <div class="panel-title">Max Price Over Time</div>
+                  <div class="panel-subtitle">Hover a point to view the full page</div>
+                </div>
+                <div class="panel-actions">
+                  <div id="chartModeControls" class="mode-controls"></div>
+                  <div id="rangeControls" class="range-controls"></div>
+                  <div id="chartLegend" class="legend"></div>
+                </div>
+              </div>
+              <div class="chart-wrap">
+                <canvas id="chart"></canvas>
+                <div id="tooltip" class="tooltip" hidden></div>
+              </div>
+            </section>
+            <div class="panel-stack">
+              <section class="panel craft-panel">
+                <div class="panel-header">
+                  <div>
+                    <div class="panel-title">Materials</div>
+                    <div class="panel-subtitle">Recipe breakdown and margin</div>
+                  </div>
+                </div>
+                <div id="craftSummary" class="craft-summary"></div>
+                <div id="craftList" class="craft-list"></div>
+              </section>
+
+              <section class="panel alerts-panel">
+                <div class="panel-header">
+                  <div>
+                    <div class="panel-title">Alerts</div>
+                    <div class="panel-subtitle">Trigger when snapshot thresholds are met</div>
+                  </div>
+                  <button id="addAlertButton" class="secondary-btn">Add alert</button>
+                </div>
+                <label class="field">
+                  <span class="field-label">Webhook URL</span>
+                  <input id="alertsWebhook" class="alias-input" placeholder="https://discord.com/api/webhooks/..." />
+                </label>
+                <div id="alertsList" class="alerts-list"></div>
+              </section>
+            </div>
+          </div>
+
+          <section class="panel" id="snapshotPanel">
             <div class="panel-header">
               <div>
-                <div class="panel-title">Max Price Over Time</div>
-                <div class="panel-subtitle">Hover a point to view the full page</div>
+                <div class="panel-title">Orders Page View</div>
+                <div id="gridMeta" class="panel-subtitle"></div>
+              </div>
+            </div>
+            <div id="grid" class="grid"></div>
+          </section>
+
+          <section class="panel grouped-panel" id="groupedPanel" hidden>
+            <div class="panel-header">
+              <div>
+                <div class="panel-title">All Orders Summary</div>
+                <div id="groupedMeta" class="panel-subtitle"></div>
+              </div>
+            </div>
+            <div id="groupedList" class="grouped-list"></div>
+          </section>
+        </div>
+
+        <div id="marginsView" hidden>
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <div class="panel-title">Margins</div>
+                <div class="panel-subtitle">Best profit based on grouped scans</div>
               </div>
               <div class="panel-actions">
-                <div id="rangeControls" class="range-controls"></div>
-                <div id="chartLegend" class="legend"></div>
+                <label class="input-inline">
+                  <span>Hours</span>
+                  <input id="marginsHours" type="number" min="1" max="168" step="1" value="24" />
+                </label>
               </div>
             </div>
-            <div class="chart-wrap">
-              <canvas id="chart"></canvas>
-              <div id="tooltip" class="tooltip" hidden></div>
-            </div>
-          </section>
-
-          <section class="panel panel-half craft-panel">
-            <div class="panel-header">
-              <div>
-                <div class="panel-title">Crafteo</div>
-                <div class="panel-subtitle">Recipe breakdown and margin</div>
-              </div>
-            </div>
-            <div id="craftSummary" class="craft-summary"></div>
-            <div id="craftList" class="craft-list"></div>
+            <div id="marginsList" class="margins-list"></div>
           </section>
         </div>
-
-        <section class="panel">
-          <div class="panel-header">
-            <div>
-              <div class="panel-title">Orders Page View</div>
-              <div id="gridMeta" class="panel-subtitle"></div>
-            </div>
-          </div>
-          <div id="grid" class="grid"></div>
-        </section>
       </main>
     </div>
+
+    <datalist id="itemsDatalist"></datalist>
 
     <script src="/app.js"></script>
   </body>
