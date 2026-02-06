@@ -294,6 +294,20 @@ body {
   color: var(--muted);
 }
 
+.alerts-view {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+.alerts-panel .panel-actions {
+  justify-content: flex-end;
+}
+
 .alerts-list {
   display: flex;
   flex-direction: column;
@@ -319,6 +333,12 @@ body {
   grid-template-columns: minmax(0, 1.2fr) repeat(4, minmax(0, 0.7fr)) auto;
   gap: 6px;
   align-items: center;
+}
+
+.alerts-confirm {
+  align-self: flex-start;
+  padding: 6px 10px;
+  font-size: 11px;
 }
 
 .alert-row input {
@@ -386,6 +406,14 @@ body {
   display: flex;
   flex-direction: column;
   gap: 24px;
+}
+
+#snapshotPanel {
+  margin-top: 16px;
+}
+
+#groupedPanel {
+  margin-top: 16px;
 }
 
 .product-header {
@@ -767,14 +795,15 @@ canvas {
 .craft-panel {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 8px;
+  padding: 14px 16px 14px;
 }
 
 .craft-summary {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
-  font-size: 12px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  font-size: 10px;
   color: var(--muted);
 }
 
@@ -782,13 +811,13 @@ canvas {
   background: #f5efe6;
   border: 1px solid #e1d8cb;
   border-radius: 10px;
-  padding: 8px 10px;
-  min-width: 140px;
+  padding: 5px 8px;
+  min-width: 0;
 }
 
 .craft-summary .metric strong {
   display: block;
-  font-size: 13px;
+  font-size: 11px;
   color: var(--ink);
 }
 
@@ -803,10 +832,11 @@ canvas {
 .craft-list {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  align-items: flex-start;
+  gap: 6px;
   overflow-y: auto;
   padding-right: 4px;
-  max-height: 220px;
+  max-height: 170px;
   scrollbar-width: thin;
   scrollbar-color: rgba(107, 111, 118, 0.45) transparent;
 }
@@ -825,20 +855,23 @@ canvas {
 }
 
 .craft-item {
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   background: #f5efe6;
   border: 1px solid #e1d8cb;
   border-radius: 12px;
-  padding: 8px 10px;
-  align-items: stretch;
+  padding: 6px 8px;
+  align-items: center;
+  width: fit-content;
+  max-width: 100%;
+  align-self: flex-start;
 }
 
 .craft-item .item-info {
-  display: flex;
-  align-items: stretch;
-  gap: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .craft-item .item-thumb {
@@ -855,7 +888,7 @@ canvas {
 
 .craft-item .item-name {
   font-weight: 600;
-  font-size: 12px;
+  font-size: 11px;
 }
 
 .craft-item .item-actions {
@@ -866,8 +899,8 @@ canvas {
 }
 
 .craft-item .craft-alias {
-  flex: 0 1 180px;
-  max-width: 200px;
+  flex: 0 1 160px;
+  max-width: 180px;
   min-width: 0;
   padding: 3px 6px;
   font-size: 10px;
@@ -890,10 +923,11 @@ canvas {
 
 .craft-item .metrics {
   margin-left: 20px;
-  text-align: left;
+  text-align: right;
   font-size: 11px;
   color: #4b4f56;
-  min-width: 110px;
+  min-width: 100px;
+  flex: 0 0 auto;
 }
 
 .craft-item .metrics strong {

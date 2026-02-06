@@ -120,13 +120,29 @@
                     <div class="panel-title">Alerts</div>
                     <div class="panel-subtitle">Trigger when snapshot thresholds are met</div>
                   </div>
-                  <button id="addAlertButton" class="secondary-btn">Add alert</button>
+                  <div class="panel-actions">
+                    <div id="alertsTabs" class="main-tabs">
+                      <button class="tab-button active" data-alert-tab="product">Producto</button>
+                      <button class="tab-button" data-alert-tab="total">Total</button>
+                      <button class="tab-button" data-alert-tab="api">API</button>
+                    </div>
+                    <button id="addAlertButton" class="secondary-btn">Add alert</button>
+                  </div>
                 </div>
-                <label class="field">
-                  <span class="field-label">Webhook URL</span>
-                  <input id="alertsWebhook" class="alias-input" placeholder="https://discord.com/api/webhooks/..." />
-                </label>
-                <div id="alertsList" class="alerts-list"></div>
+                <div id="alertsProductView" class="alerts-view">
+                  <button data-alert-confirm="product" class="secondary-btn alerts-confirm">Confirm alerts</button>
+                  <div id="alertsList" class="alerts-list"></div>
+                </div>
+                <div id="alertsTotalView" class="alerts-view" hidden>
+                  <button data-alert-confirm="total" class="secondary-btn alerts-confirm">Confirm alerts</button>
+                  <div id="alertsListAll" class="alerts-list"></div>
+                </div>
+                <div id="alertsApiView" class="alerts-view" hidden>
+                  <label class="field">
+                    <span class="field-label">Webhook URL</span>
+                    <input id="alertsWebhook" class="alias-input" placeholder="https://discord.com/api/webhooks/..." />
+                  </label>
+                </div>
               </section>
             </div>
           </div>

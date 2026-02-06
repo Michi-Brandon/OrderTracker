@@ -24,11 +24,7 @@ pnpm-debug.log*
 *.key
 *.pem
 
-# Local data / logs
-orders-snapshots.jsonl
-orders-log.jsonl
-orders-tracked.json
-orders-aliases.json
+# Logs
 *.log
 
 # OS / editor

@@ -30,15 +30,22 @@ const productView = document.getElementById('productView')
 const marginsView = document.getElementById('marginsView')
 const marginsHoursInput = document.getElementById('marginsHours')
 const marginsList = document.getElementById('marginsList')
-const tabs = Array.from(document.querySelectorAll('.tab-button'))
+const tabs = Array.from(document.querySelectorAll('[data-tab]'))
 const alertsWebhookInput = document.getElementById('alertsWebhook')
 const alertsList = document.getElementById('alertsList')
 const addAlertButton = document.getElementById('addAlertButton')
+const alertsTabs = Array.from(document.querySelectorAll('[data-alert-tab]'))
+const alertsProductView = document.getElementById('alertsProductView')
+const alertsTotalView = document.getElementById('alertsTotalView')
+const alertsApiView = document.getElementById('alertsApiView')
+const alertsListAll = document.getElementById('alertsListAll')
+const confirmAlertsButtons = Array.from(document.querySelectorAll('[data-alert-confirm]'))
 const itemsDatalist = document.getElementById('itemsDatalist')
 
 let snapshots = []
 let chartPoints = []
 let chartSnapshots = []
+let chartOutlierBoxes = []
 let hoverIndex = null
 let activeIndex = null
 let itemsCatalog = []
@@ -56,6 +63,7 @@ let groupedRuns = []
 let latestGroupedRun = null
 let marginsHours = 24
 let alertsConfig = { webhookUrl: '', rules: [] }
+let alertsTab = 'product'
 let recipeCache = new Map()
 
 function formatPrice (value) {
@@ -85,6 +93,12 @@ function formatAxisTime (ts) {
 function formatDateTime (ts) {
   if (!ts) return '—'
   return new Date(ts).toLocaleString()
+}
+
+function parseNumberOrNull (value) {
+  if (value == null || value === '') return null
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : null
 }
 
 
@@ -169,6 +183,7 @@ function initSidebarSections () {
 function normalizeItemKey (value) {
   return (value || '')
     .toLowerCase()
+    .replace(/^minecraft:/, '')
     .replace(/["']/g, '')
     .replace(/[^a-z0-9\s_\-]/g, '')
     .trim()
@@ -383,6 +398,7 @@ function setSelectedProduct (item) {
   loadRecipeForSelected()
   renderChart()
   renderActiveSnapshot()
+  renderAlerts()
 }
 
 function updateProductLabels (snapshot = null, options = {}) {
@@ -575,6 +591,17 @@ function setActiveTab (tab) {
   if (tab === 'margins') {
     renderMargins()
   }
+}
+
+function setAlertsTab (tab) {
+  alertsTab = tab
+  alertsTabs.forEach((button) => {
+    button.classList.toggle('active', button.dataset.alertTab === tab)
+  })
+  if (alertsProductView) alertsProductView.hidden = tab !== 'product'
+  if (alertsTotalView) alertsTotalView.hidden = tab !== 'total'
+  if (alertsApiView) alertsApiView.hidden = tab !== 'api'
+  renderAlerts()
 }
 async function trackSelectedProduct () {
   if (!selectedProduct?.key) return
@@ -988,26 +1015,35 @@ async function saveAlertsConfig () {
   }
 }
 
-function renderAlerts () {
-  if (!alertsList) return
-  alertsList.innerHTML = ''
-  const rules = Array.isArray(alertsConfig.rules) ? alertsConfig.rules : []
+function renderAlertsList (listEl, rules, options = {}) {
+  if (!listEl) return
+  listEl.innerHTML = ''
+  const productLocked = options.productLocked
+  const lockedProductKey = options.productKey || ''
+
+  if (rules.length === 0) {
+    listEl.innerHTML = '<div class="meta">No alerts configured.</div>'
+    return
+  }
+
   for (const rule of rules) {
     const row = document.createElement('div')
     row.className = 'alert-row'
     row.dataset.id = rule.id
+    const productValue = productLocked ? lockedProductKey : (rule.productKey || '')
     row.innerHTML = `
-      <input class="alert-item" list="itemsDatalist" placeholder="item key" value="${rule.productKey || ''}" />
+      <input class="alert-item" list="itemsDatalist" placeholder="item key" value="${productValue}" ${productLocked ? 'disabled' : ''} />
       <input class="alert-min" type="number" placeholder="Min $" value="${rule.priceMin ?? ''}" />
       <input class="alert-max" type="number" placeholder="Max $" value="${rule.priceMax ?? ''}" />
       <input class="alert-qty-min" type="number" placeholder="Min qty" value="${rule.qtyMin ?? ''}" />
       <input class="alert-qty-max" type="number" placeholder="Max qty" value="${rule.qtyMax ?? ''}" />
       <button class="alert-remove" type="button">✕</button>
     `
+
     const inputs = row.querySelectorAll('input')
     inputs.forEach((input) => {
       input.addEventListener('change', () => {
-        rule.productKey = row.querySelector('.alert-item').value.trim()
+        rule.productKey = productLocked ? lockedProductKey : row.querySelector('.alert-item').value.trim()
         rule.priceMin = row.querySelector('.alert-min').value.trim()
         rule.priceMax = row.querySelector('.alert-max').value.trim()
         rule.qtyMin = row.querySelector('.alert-qty-min').value.trim()
@@ -1015,6 +1051,7 @@ function renderAlerts () {
         saveAlertsConfig()
       })
     })
+
     const removeBtn = row.querySelector('.alert-remove')
     if (removeBtn) {
       removeBtn.addEventListener('click', () => {
@@ -1023,7 +1060,40 @@ function renderAlerts () {
         saveAlertsConfig()
       })
     }
-    alertsList.appendChild(row)
+
+    listEl.appendChild(row)
+  }
+}
+
+function renderAlerts () {
+  if (!alertsList) return
+  if (!alertsListAll) return
+
+  const rules = Array.isArray(alertsConfig.rules) ? alertsConfig.rules : []
+  const selectedKey = selectedProduct?.key || ''
+  const productConfirm = confirmAlertsButtons.find((button) => button.dataset.alertConfirm === 'product')
+  const totalConfirm = confirmAlertsButtons.find((button) => button.dataset.alertConfirm === 'total')
+
+  if (alertsTab === 'product') {
+    alertsListAll.innerHTML = ''
+    if (!selectedKey) {
+      alertsList.innerHTML = '<div class="meta">Select a product to configure alerts.</div>'
+      if (productConfirm) productConfirm.disabled = true
+      return
+    }
+    if (productConfirm) productConfirm.disabled = false
+    const filtered = rules.filter((rule) => rule.productKey === selectedKey)
+    renderAlertsList(alertsList, filtered, { productLocked: true, productKey: selectedKey })
+  } else if (alertsTab === 'total') {
+    alertsList.innerHTML = ''
+    if (productConfirm) productConfirm.disabled = true
+    if (totalConfirm) totalConfirm.disabled = false
+    renderAlertsList(alertsListAll, rules, { productLocked: false })
+  } else {
+    alertsList.innerHTML = ''
+    alertsListAll.innerHTML = ''
+    if (productConfirm) productConfirm.disabled = true
+    if (totalConfirm) totalConfirm.disabled = true
   }
 }
 
@@ -1128,6 +1198,54 @@ async function renderMargins () {
   }
 }
 
+function getAlertHitIndexes (snapshotsList) {
+  if (!selectedProduct?.key) return new Set()
+  if (!alertsConfig || !Array.isArray(alertsConfig.rules)) return new Set()
+  const rules = alertsConfig.rules.filter((rule) => rule?.productKey === selectedProduct.key)
+  if (rules.length === 0) return new Set()
+
+  const hits = new Set()
+  const cooldowns = new Map()
+  const fallbackCooldownMs = 300000
+
+  for (let i = 0; i < snapshotsList.length; i += 1) {
+    const snapshot = snapshotsList[i]
+    const max = getMaxSlot(snapshot, selectedProduct.key)
+    if (!max || !Number.isFinite(max.price)) continue
+    const price = max.price
+    const orderedQty = Number(max.amountOrdered) || 0
+    const userKey = typeof max.userName === 'string' ? max.userName.trim().toLowerCase() : ''
+    const tsMs = new Date(snapshot.ts).getTime()
+
+    for (const rule of rules) {
+      const priceMin = parseNumberOrNull(rule.priceMin)
+      const priceMax = parseNumberOrNull(rule.priceMax)
+      const qtyMin = parseNumberOrNull(rule.qtyMin)
+      const qtyMax = parseNumberOrNull(rule.qtyMax)
+
+      if (priceMin != null && price < priceMin) continue
+      if (priceMax != null && price > priceMax) continue
+      if (qtyMin != null && orderedQty < qtyMin) continue
+      if (qtyMax != null && orderedQty > qtyMax) continue
+
+      if (userKey) {
+        const cooldownKey = `${rule.id}:${userKey}`
+        const cooldownUntil = cooldowns.get(cooldownKey)
+        if (cooldownUntil && cooldownUntil > tsMs) continue
+        const expiresAt = Number.isFinite(Number(max.expiresAt))
+          ? Number(max.expiresAt)
+          : tsMs + fallbackCooldownMs
+        cooldowns.set(cooldownKey, expiresAt)
+      }
+
+      hits.add(i)
+      break
+    }
+  }
+
+  return hits
+}
+
 function renderChart () {
   const dpr = window.devicePixelRatio || 1
   const rect = chart.getBoundingClientRect()
@@ -1139,6 +1257,7 @@ function renderChart () {
   ctx.clearRect(0, 0, rect.width, rect.height)
 
   chartSnapshots = chartMode === 'grouped' ? getFilteredGroupedSeries() : getFilteredSnapshots()
+  chartOutlierBoxes = []
 
   if (chartSnapshots.length === 0) {
     ctx.fillStyle = '#666'
@@ -1155,6 +1274,7 @@ function renderChart () {
   const maxSlots = chartSnapshots.map((s) => getMaxSlot(s))
   const prices = maxSlots.map((max) => max?.price || 0)
   const maxPrice = Math.max(...prices, 1)
+  const alertHits = chartMode === 'snapshot' ? getAlertHitIndexes(chartSnapshots) : new Set()
 
   chartPoints = chartSnapshots.map((snap, idx) => {
     const x = padding.left + (width * idx) / Math.max(chartSnapshots.length - 1, 1)
@@ -1203,7 +1323,7 @@ function renderChart () {
   ctx.stroke()
 
   chartPoints.forEach((pt) => {
-    ctx.fillStyle = '#1f2933'
+    ctx.fillStyle = alertHits.has(pt.idx) ? '#2fbf9c' : '#1f2933'
     ctx.beginPath()
     ctx.arc(pt.x, pt.y, 4, 0, Math.PI * 2)
     ctx.fill()
@@ -1222,12 +1342,9 @@ function renderChart () {
     ctx.font = '11px Space Grotesk, sans-serif'
     ctx.fillStyle = '#1f2933'
     ctx.strokeStyle = 'rgba(31,41,51,0.2)'
+    const seenUsers = new Set()
 
-    chartPoints.forEach((pt, idx) => {
-      const price = prices[idx]
-      if (price < threshold) return
-      const max = maxSlots[idx]
-      if (!max) return
+    const drawBox = (pt, max, price, options = {}) => {
       const paid = Number.isFinite(max.amountDelivered) ? max.amountDelivered * price : null
       const total = Number.isFinite(max.amountOrdered) ? max.amountOrdered * price : null
       const lines = [
@@ -1251,13 +1368,46 @@ function renderChart () {
       if (boxX < 8) boxX = 8
       if (boxY < 8) boxY = pt.y + 8
 
+      if (options.capture) {
+        chartOutlierBoxes.push({
+          idx: pt.idx,
+          x: boxX,
+          y: boxY,
+          w: boxWidth,
+          h: boxHeight
+        })
+      }
+
       ctx.fillStyle = 'rgba(31, 41, 51, 0.88)'
       ctx.fillRect(boxX, boxY, boxWidth, boxHeight)
       ctx.fillStyle = '#fff'
       lines.forEach((line, i) => {
         ctx.fillText(line, boxX + paddingX, boxY + paddingY + (i + 1) * lineHeight - 3)
       })
+    }
+
+    chartPoints.forEach((pt, idx) => {
+      const price = prices[idx]
+      if (price < threshold) return
+      const max = maxSlots[idx]
+      if (!max) return
+      const userKey = typeof max.userName === 'string' ? max.userName.trim().toLowerCase() : ''
+      if (userKey) {
+        if (seenUsers.has(userKey)) return
+        seenUsers.add(userKey)
+      }
+      if (hoverIndex === idx) return
+      drawBox(pt, max, price, { capture: true })
     })
+
+    if (hoverIndex != null) {
+      const hoverPrice = prices[hoverIndex]
+      const hoverMax = maxSlots[hoverIndex]
+      const hoverPoint = chartPoints.find((p) => p.idx === hoverIndex)
+      if (hoverPoint && hoverMax && hoverPrice >= threshold) {
+        drawBox(hoverPoint, hoverMax, hoverPrice, { capture: true })
+      }
+    }
   }
 
   if (hoverIndex != null) {
@@ -1559,11 +1709,33 @@ chart.addEventListener('mousemove', (event) => {
     positionTooltip(closest.x, closest.y)
 
     renderChart()
-  } else {
-    hoverIndex = null
+    return
+  }
+
+  let hitBox = null
+  for (let i = chartOutlierBoxes.length - 1; i >= 0; i -= 1) {
+    const box = chartOutlierBoxes[i]
+    if (
+      x >= box.x &&
+      x <= box.x + box.w &&
+      y >= box.y &&
+      y <= box.y + box.h
+    ) {
+      hitBox = box
+      break
+    }
+  }
+
+  if (hitBox) {
+    hoverIndex = hitBox.idx
     tooltip.hidden = true
     renderChart()
+    return
   }
+
+  hoverIndex = null
+  tooltip.hidden = true
+  renderChart()
 })
 
 chart.addEventListener('mouseleave', () => {
@@ -1682,13 +1854,40 @@ async function init () {
       saveAlertsConfig()
     })
   }
+  if (alertsTabs.length > 0) {
+    alertsTabs.forEach((button) => {
+      button.addEventListener('click', () => {
+        setAlertsTab(button.dataset.alertTab)
+      })
+    })
+    setAlertsTab(alertsTab)
+  }
+  if (confirmAlertsButtons.length > 0) {
+    confirmAlertsButtons.forEach((button) => {
+      button.addEventListener('click', () => {
+        const scope = button.dataset.alertConfirm || 'product'
+        if (scope === 'total') {
+          const rules = Array.isArray(alertsConfig.rules) ? alertsConfig.rules : []
+          console.log(`Alerts confirmed (total): ${rules.length} rule(s).`, rules)
+          return
+        }
+        const key = selectedProduct?.key
+        if (!key) {
+          console.log('Alerts: no product selected.')
+          return
+        }
+        const rules = (alertsConfig.rules || []).filter((r) => r.productKey === key)
+        console.log(`Alerts confirmed for ${key}: ${rules.length} rule(s).`, rules)
+      })
+    })
+  }
   if (addAlertButton) {
     addAlertButton.addEventListener('click', () => {
       const id = `alert_${Date.now()}_${Math.random().toString(16).slice(2, 6)}`
       alertsConfig.rules = alertsConfig.rules || []
       alertsConfig.rules.push({
         id,
-        productKey: selectedProduct?.key || '',
+        productKey: alertsTab === 'product' ? (selectedProduct?.key || '') : '',
         priceMin: '',
         priceMax: '',
         qtyMin: '',

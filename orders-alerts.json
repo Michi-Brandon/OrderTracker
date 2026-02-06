@@ -1,0 +1,13 @@
+{
+  "webhookUrl": "https://discord.com/api/webhooks/1469326126156480620/zJ9IKj0H_-fOULu6tArayHFi-EigTlvmHZeOjU2UvNjAZXAwNFlFV0Y23UvHl1GB1lb8",
+  "rules": [
+    {
+      "id": "alert_1770384741993_cfda",
+      "productKey": "repeater",
+      "priceMin": 2000,
+      "priceMax": null,
+      "qtyMin": 100,
+      "qtyMax": null
+    }
+  ]
+}

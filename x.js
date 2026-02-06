@@ -54,7 +54,8 @@ const ordersOpenTimeoutMs = Number(process.env.ORDERS_OPEN_TIMEOUT_MS || 15000)
 const searchAllOpenTimeoutMs = Number(process.env.ORDERS_SEARCH_ALL_OPEN_TIMEOUT_MS || Math.max(ordersOpenTimeoutMs * 4, 60000))
 const searchAllTimeoutMs = Number(process.env.ORDERS_SEARCH_ALL_TIMEOUT_MS || 300000)
 const searchAllRequestTimeoutMs = Number(process.env.ORDERS_SEARCH_ALL_REQUEST_TIMEOUT_MS || 600000)
-const searchAllPageDelayMs = Number(process.env.ORDERS_SEARCH_ALL_PAGE_DELAY_MS || 25000)
+const searchAllPageDelayMinMs = Number(process.env.ORDERS_SEARCH_ALL_PAGE_DELAY_MIN_MS || 1000)
+const searchAllPageDelayMaxMs = Number(process.env.ORDERS_SEARCH_ALL_PAGE_DELAY_MAX_MS || 2000)
 const ordersCloseDelayMs = Number(process.env.ORDERS_CLOSE_DELAY_MS || 800)
 const ordersStartDelayMs = Number(process.env.ORDERS_START_DELAY_MS || 7000)
 const ordersHumanDelayMinMs = Number(process.env.ORDERS_HUMAN_DELAY_MIN_MS || 300)
@@ -64,6 +65,11 @@ const ordersApiPort = Number(process.env.ORDERS_API_PORT || 3010)
 const ordersAutoTrack = process.env.ORDERS_AUTOTRACK !== '0'
 const ordersProductKey = process.env.ORDERS_PRODUCT || 'repeater'
 const ordersCommandPrefix = process.env.ORDERS_CMD_PREFIX || `/orders`
+const ordersMinMatches = Number(process.env.ORDERS_MIN_MATCHES || 3)
+const ordersPageSearchLimit = Number(process.env.ORDERS_PAGE_SEARCH_LIMIT || 6)
+const ordersPageDelayMs = Number(process.env.ORDERS_PAGE_DELAY_MS || 1200)
+const alertAverageWindowMs = Number(process.env.ALERT_AVG_WINDOW_MS || 86_400_000)
+const alertUserCooldownMs = Number(process.env.ALERT_USER_COOLDOWN_MS || 300_000)
 
 const ordersLogPath = path.join(__dirname, 'orders-snapshots.jsonl')
 const ordersAllLogPath = path.join(__dirname, 'orders-all.jsonl')
@@ -105,8 +111,10 @@ let searchAllRunTs = null
 let searchAllLastRunTs = null
 let searchAllRequestedAt = null
 let searchAllStartedAt = null
+let searchAllScannerActive = false
 let alertsConfig = { webhookUrl: '', rules: [] }
-let alertLastTriggered = new Map()
+let alertUserCooldown = new Map()
+const priceHistory = new Map()
 
 const trackedProducts = new Map()
 const pendingQueue = []
@@ -118,6 +126,7 @@ loadAliases()
 loadTrackedList()
 loadAlertsConfig()
 loadSearchAllLastRun()
+seedPriceHistory()
 
 bot.once('spawn', () => {
   console.log(`Spawned on ${host} as ${bot.username} (version ${version}, auth ${auth})`)
@@ -545,6 +554,160 @@ function hasNextArrowSlot (snapshotSlot, windowItem) {
   return loreHasNext && (isArrow || label.includes('next'))
 }
 
+const sortOptions = [
+  { key: 'most_paid', label: 'Most Paid' },
+  { key: 'most_delivered', label: 'Most Delivered' },
+  { key: 'recently_listed', label: 'Recently Listed' },
+  { key: 'most_money_per_item', label: 'Most Money Per Item' }
+]
+
+function extractTextFromComponent (component) {
+  if (component == null) return ''
+  if (typeof component === 'string') return component
+  let text = ''
+  if (typeof component.text === 'string') text += component.text
+  if (Array.isArray(component.extra)) {
+    for (const part of component.extra) {
+      text += extractTextFromComponent(part)
+    }
+  }
+  return text
+}
+
+function componentHasGreen (component) {
+  if (!component || typeof component !== 'object') return false
+  const color = typeof component.color === 'string' ? component.color.toLowerCase() : ''
+  if (color === 'green' || color === 'dark_green') return true
+  if (Array.isArray(component.extra)) {
+    return component.extra.some((part) => componentHasGreen(part))
+  }
+  return false
+}
+
+function parseLoreLineInfo (rawLine) {
+  const rawString = typeof rawLine === 'string' ? rawLine : String(rawLine)
+  let text = rawString
+  let selected = /§a|§2/i.test(rawString)
+
+  try {
+    const parsed = JSON.parse(rawString)
+    text = extractTextFromComponent(parsed)
+    if (componentHasGreen(parsed)) selected = true
+  } catch (err) {
+    // Not JSON.
+  }
+
+  return {
+    text: stripFormatting(text),
+    selected
+  }
+}
+
+function findSortControlSlot (window) {
+  if (!window || !Array.isArray(window.slots)) return null
+  const max = Math.min(window.slots.length, 54)
+  for (let i = 0; i < max; i += 1) {
+    const item = window.slots[i]
+    if (!item) continue
+    const name = String(item.name || '').toLowerCase()
+    const label = getSlotLabel(item).toLowerCase()
+    if (name.includes('cauldron') || label.includes('cauldron')) {
+      return { index: i, item }
+    }
+  }
+  return null
+}
+
+function getSortSelection (window) {
+  const control = findSortControlSlot(window)
+  if (!control) return null
+  const loreLines = getLoreLines(control.item)
+  if (!loreLines || loreLines.length === 0) return null
+  const parsed = loreLines.map(parseLoreLineInfo)
+  for (const option of sortOptions) {
+    const match = parsed.find((line) => line.text.toLowerCase().includes(option.label.toLowerCase()))
+    if (match && match.selected) return option.key
+  }
+  return null
+}
+
+function clickWindowSlot (slotIndex) {
+  try {
+    bot.clickWindow(slotIndex, 0, 0)
+    return true
+  } catch (err) {
+    console.warn('Failed to click slot:', err && err.message ? err.message : err)
+    return false
+  }
+}
+
+async function ensureSortOption (window, desiredKey, maxAttempts = 5) {
+  const control = findSortControlSlot(window)
+  if (!control) return { ok: false, window }
+  let currentWindow = window
+  let attempts = 0
+
+  while (attempts < maxAttempts) {
+    const selected = getSortSelection(currentWindow)
+    if (selected === desiredKey) {
+      return { ok: true, window: currentWindow }
+    }
+    clickWindowSlot(control.index)
+    await delay(600)
+    currentWindow = bot.currentWindow || currentWindow
+    attempts += 1
+  }
+
+  return { ok: false, window: currentWindow }
+}
+
+function slotMatchesProduct (slot, productKey) {
+  if (!slot?.item || !productKey) return false
+  const target = normalizeProductKey(productKey)
+  const nameKey = normalizeProductKey(slot.item.name || '')
+  if (nameKey && nameKey === target) return true
+  const displayKey = normalizeProductKey(slot.item.displayName || '')
+  if (displayKey && displayKey === target) return true
+  return false
+}
+
+function countMatchingSlots (snapshot, productKey) {
+  if (!snapshot?.slots || !productKey) return 0
+  return snapshot.slots.filter((slot) => slotMatchesProduct(slot, productKey)).length
+}
+
+async function captureOrdersSnapshotWithPagination (window, meta, options = {}) {
+  if (!window) return null
+  let currentWindow = window
+  let page = meta?.page || 1
+  let snapshot = null
+  const minMatches = Number.isFinite(options.minMatches) ? options.minMatches : ordersMinMatches
+  const maxPages = Number.isFinite(options.maxPages) ? options.maxPages : ordersPageSearchLimit
+  let attempts = 0
+
+  while (currentWindow && attempts < maxPages) {
+    snapshot = dumpWindowSlotsWithMeta(currentWindow, { ...meta, page, recordTo: 'none' })
+    const matches = countMatchingSlots(snapshot, meta?.productKey)
+    const slot53 = snapshot?.slots ? snapshot.slots[53] : null
+    const next = hasNextArrowSlot(slot53, currentWindow?.slots ? currentWindow.slots[53] : null) || hasNextArrow(currentWindow)
+    if (matches >= minMatches || !next) break
+    if (!clickNextArrow()) break
+    await delay(ordersPageDelayMs)
+    const signature = windowSignature(currentWindow)
+    const changed = await waitForWindowChange(() => bot.currentWindow || currentWindow, signature, 6000)
+    if (!changed) break
+    currentWindow = bot.currentWindow || currentWindow
+    page += 1
+    attempts += 1
+  }
+
+  if (snapshot) {
+    recordPageSnapshot(snapshot)
+  }
+
+  return snapshot
+}
+
 function clickNextArrow () {
   try {
     bot.clickWindow(53, 0, 0)
@@ -581,12 +744,16 @@ function delay (ms) {
 
 async function scanSearchAllPages (window) {
   if (!window) return
+  searchAllScannerActive = true
   const runId = searchAllRunId
   const runTs = searchAllRunTs
   let page = 1
   let currentWindow = window
   let safety = 0
   const seenSignatures = new Set()
+
+  const sortResult = await ensureSortOption(currentWindow, 'recently_listed')
+  currentWindow = sortResult.window || currentWindow
 
   while (currentWindow && searchAllRunning && safety < 200) {
     if (searchAllStartedAt && Date.now() - searchAllStartedAt > searchAllTimeoutMs) {
@@ -626,7 +793,8 @@ async function scanSearchAllPages (window) {
     }
     console.log(`Search all clicking Next (page ${page})`)
     if (!clickNextArrow()) break
-    await delay(searchAllPageDelayMs)
+    const pageDelay = randomBetween(searchAllPageDelayMinMs, searchAllPageDelayMaxMs)
+    await delay(pageDelay)
     const changed = await waitForWindowChange(() => bot.currentWindow || currentWindow, signature, 6000)
     if (!changed) {
       console.warn('Search all page did not change after clicking Next; stopping.')
@@ -646,6 +814,7 @@ function finishSearchAll (window) {
   searchAllRunId = null
   searchAllRunTs = null
   searchAllStartedAt = null
+  searchAllScannerActive = false
   if (ordersOpenTimeout) {
     clearTimeout(ordersOpenTimeout)
     ordersOpenTimeout = null
@@ -911,12 +1080,15 @@ function closeOrdersWindow (window) {
   }
 }
 
-bot.on('windowOpen', (window) => {
+bot.on('windowOpen', async (window) => {
   if (!enableOrders) {
     return
   }
 
   if (searchAllRunning || currentTask?.type === 'searchAll') {
+    if (searchAllScannerActive) {
+      return
+    }
     expectOrdersWindow = false
     ordersInFlight = false
     if (ordersOpenTimeout) {
@@ -941,7 +1113,19 @@ bot.on('windowOpen', (window) => {
     ordersOpenTimeout = null
   }
   const productKey = currentTask?.productKey || ordersProductKey
-  captureOrdersSnapshot(window, { page: 1, productKey })
+  let activeWindow = window
+  let sortFallback = false
+  const sortResult = await ensureSortOption(window, 'most_money_per_item')
+  activeWindow = sortResult.window || activeWindow
+  sortFallback = !sortResult.ok
+  await captureOrdersSnapshotWithPagination(activeWindow, {
+    page: 1,
+    productKey,
+    sortByPrice: sortFallback
+  }, {
+    minMatches: ordersMinMatches,
+    maxPages: ordersPageSearchLimit
+  })
   const tracked = trackedProducts.get(productKey)
   if (tracked) {
     tracked.lastRunAt = Date.now()
@@ -949,7 +1133,7 @@ bot.on('windowOpen', (window) => {
 
   const closeDelay = Math.max(ordersCloseDelayMs, 0)
   setTimeout(() => {
-    closeOrdersWindow(window)
+    closeOrdersWindow(bot.currentWindow || activeWindow || window)
     finishCurrentTask()
   }, closeDelay)
 })
@@ -988,7 +1172,7 @@ function dumpWindowSlotsWithMeta (window, meta) {
     }
   }
 
-  const slots = []
+  let slots = []
   for (let i = 0; i < containerSlots; i += 1) {
     const item = window.slots[i]
     const itemInfo = item
@@ -1024,7 +1208,21 @@ function dumpWindowSlotsWithMeta (window, meta) {
     })
   }
 
+  if (meta?.sortByPrice) {
+    const orderSlots = slots.filter((slot) => slot.order)
+    orderSlots.sort((a, b) => {
+      const priceDiff = (b.order?.price || 0) - (a.order?.price || 0)
+      if (priceDiff !== 0) return priceDiff
+      return (b.order?.amountOrdered || 0) - (a.order?.amountOrdered || 0)
+    })
+    const rest = slots.filter((slot) => !slot.order)
+    slots = [...orderSlots, ...rest]
+  }
+
   const snapshot = buildOrdersSnapshot(slots, meta)
+  if (meta && meta.recordTo === 'none') {
+    return snapshot
+  }
   if (meta && meta.recordTo === 'all') {
     recordAllPageSnapshot(snapshot)
   } else {
@@ -1232,7 +1430,8 @@ function buildOrdersSnapshot (slots, meta) {
         amountOrdered: maxSlot.order.amountOrdered,
         amountDelivered: maxSlot.order.amountDelivered,
         slot: maxSlot.slot,
-        userName: maxSlot.order.userName
+        userName: maxSlot.order.userName,
+        expiresAt: maxSlot.order.expiresAt ?? null
       }
     : null
 
@@ -1258,6 +1457,7 @@ function recordPageSnapshot (snapshot) {
     fs.appendFileSync(ordersLogPath, JSON.stringify(snapshot) + '\n', 'utf8')
     const size = fs.statSync(ordersLogPath).size
     console.log(`Snapshot saved (${size} bytes)`)
+    updatePriceHistory(snapshot)
     evaluateAlerts(snapshot)
   } catch (err) {
     console.warn('Failed to write orders log:', err && err.message ? err.message : err)
@@ -1325,33 +1525,100 @@ function formatNumberCompact (value) {
   return `${value}`
 }
 
+function updatePriceHistory (snapshot) {
+  if (!snapshot?.productKey || !snapshot?.max || !Number.isFinite(snapshot.max.price)) return
+  const key = snapshot.productKey
+  const ts = new Date(snapshot.ts).getTime()
+  if (!Number.isFinite(ts)) return
+  const entry = priceHistory.get(key) || []
+  entry.push({ ts, price: snapshot.max.price })
+  const cutoff = Date.now() - alertAverageWindowMs
+  while (entry.length && entry[0].ts < cutoff) {
+    entry.shift()
+  }
+  priceHistory.set(key, entry)
+}
+
+function seedPriceHistory () {
+  try {
+    if (!fs.existsSync(ordersLogPath)) return
+    const raw = fs.readFileSync(ordersLogPath, 'utf8')
+    const lines = raw.split(/\r?\n/).filter((line) => line.trim() !== '')
+    const cutoff = Date.now() - alertAverageWindowMs
+    for (const line of lines) {
+      try {
+        const snapshot = JSON.parse(line)
+        if (!snapshot?.productKey || !snapshot?.max || !Number.isFinite(snapshot.max.price)) continue
+        const ts = new Date(snapshot.ts).getTime()
+        if (!Number.isFinite(ts) || ts < cutoff) continue
+        const entry = priceHistory.get(snapshot.productKey) || []
+        entry.push({ ts, price: snapshot.max.price })
+        priceHistory.set(snapshot.productKey, entry)
+      } catch {
+        // ignore bad line
+      }
+    }
+  } catch (err) {
+    console.warn('Failed to seed price history:', err && err.message ? err.message : err)
+  }
+}
+
+function getAveragePrice (productKey) {
+  if (!productKey) return null
+  const entry = priceHistory.get(productKey)
+  if (!entry || entry.length === 0) return null
+  const sum = entry.reduce((acc, item) => acc + item.price, 0)
+  return sum / entry.length
+}
+
 function evaluateAlerts (snapshot) {
   if (!snapshot || !snapshot.productKey || !snapshot.max) return
   if (!alertsConfig || !alertsConfig.webhookUrl || !Array.isArray(alertsConfig.rules)) return
   const productKey = snapshot.productKey
   const max = snapshot.max
-  const remaining = Math.max((max.amountOrdered || 0) - (max.amountDelivered || 0), 0)
+  const orderedQty = max.amountOrdered || 0
+  const deliveredQty = max.amountDelivered || 0
+  const remaining = Math.max(orderedQty - deliveredQty, 0)
   const price = max.price
+  const avgPrice = getAveragePrice(productKey)
+  const userKey = typeof max.userName === 'string' ? max.userName.trim().toLowerCase() : ''
+  const now = Date.now()
+
+  for (const [key, expiry] of alertUserCooldown.entries()) {
+    if (expiry <= now) alertUserCooldown.delete(key)
+  }
 
   for (const rule of alertsConfig.rules) {
     if (!rule || rule.productKey !== productKey) continue
     if (rule.priceMin != null && price < rule.priceMin) continue
     if (rule.priceMax != null && price > rule.priceMax) continue
-    if (rule.qtyMin != null && remaining < rule.qtyMin) continue
-    if (rule.qtyMax != null && remaining > rule.qtyMax) continue
+    if (rule.qtyMin != null && orderedQty < rule.qtyMin) continue
+    if (rule.qtyMax != null && orderedQty > rule.qtyMax) continue
 
-    const lastKey = `${rule.id}:${snapshot.ts}`
-    if (alertLastTriggered.has(lastKey)) continue
-    alertLastTriggered.set(lastKey, Date.now())
+    if (userKey) {
+      const cooldownKey = `${rule.id}:${productKey}:${userKey}`
+      const cooldownUntil = alertUserCooldown.get(cooldownKey)
+      if (cooldownUntil && cooldownUntil > now) continue
+      const expiresAt = Number.isFinite(max.expiresAt) ? max.expiresAt : now + alertUserCooldownMs
+      alertUserCooldown.set(cooldownKey, expiresAt)
+    }
+
+    const totalSale = orderedQty * price
+    const diff = avgPrice != null ? price - avgPrice : null
+    const potentialGain = diff != null ? diff * orderedQty : null
 
     sendAlertWebhook({
       productKey,
       productName: snapshot.productName || productKey,
       price,
       remaining,
-      delivered: max.amountDelivered ?? 0,
-      ordered: max.amountOrdered ?? 0,
-      ts: snapshot.ts
+      delivered: deliveredQty,
+      ordered: orderedQty,
+      ts: snapshot.ts,
+      userName: max.userName || 'unknown',
+      avgPrice,
+      totalSale,
+      potentialGain
     })
   }
 }
@@ -1360,10 +1627,20 @@ async function sendAlertWebhook (payload) {
   const webhookUrl = alertsConfig?.webhookUrl
   if (!webhookUrl) return
 
+  const avgLabel = payload.avgPrice != null ? formatPriceCompact(payload.avgPrice) : 'n/a'
+  const totalLabel = Number.isFinite(payload.totalSale) ? formatPriceCompact(payload.totalSale) : 'n/a'
+  const gainLabel = Number.isFinite(payload.potentialGain)
+    ? `${payload.potentialGain >= 0 ? '+' : '-'}${formatPriceCompact(Math.abs(payload.potentialGain))}`
+    : 'n/a'
+
   const content = [
     `Order alert: ${payload.productName}`,
-    `Price: ${formatPriceCompact(payload.price)}`,
-    `Remaining: ${formatNumberCompact(payload.remaining)} (${formatNumberCompact(payload.delivered)}/${formatNumberCompact(payload.ordered)} delivered)`,
+    `User: ${payload.userName}`,
+    `Unit: ${formatPriceCompact(payload.price)}`,
+    `Qty ordered: ${formatNumberCompact(payload.ordered)} (delivered ${formatNumberCompact(payload.delivered)}, remaining ${formatNumberCompact(payload.remaining)})`,
+    `Total sale: ${totalLabel}`,
+    `Avg price: ${avgLabel}`,
+    `Potential gain vs avg: ${gainLabel}`,
     `Snapshot: ${payload.ts}`
   ].join('\n')
 
@@ -1374,6 +1651,7 @@ async function sendAlertWebhook (payload) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ content })
       })
+      console.log(`Discord alert sent:\n${content}`)
     } else {
       console.warn('Fetch not available; alert not sent.')
     }

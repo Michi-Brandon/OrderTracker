@@ -8,8 +8,12 @@ const mcVersion = process.env.MC_VERSION || '1.20.2'
 const dataPath = path.join(__dirname, 'orders-snapshots.jsonl')
 const allDataPath = path.join(__dirname, 'orders-all.jsonl')
 const publicDir = path.join(__dirname, 'dashboard')
-const textureRoot = path.join(__dirname, 'node_modules', 'prismarine-viewer', 'public', 'textures', '1.20.1', 'items')
-const blockTextureRoot = path.join(__dirname, 'node_modules', 'prismarine-viewer', 'public', 'textures', '1.20.1', 'blocks')
+const texturesBase = path.join(__dirname, 'node_modules', 'prismarine-viewer', 'public', 'textures', '1.20.1')
+const textureRoot = path.join(texturesBase, 'items')
+const blockTextureRoot = path.join(texturesBase, 'blocks')
+const itemsTexturesPath = path.join(texturesBase, 'items_textures.json')
+const blocksTexturesPath = path.join(texturesBase, 'blocks_textures.json')
+const textureContentPath = path.join(texturesBase, 'texture_content.json')
 const placeholderPath = path.join(publicDir, 'item-placeholder.svg')
 
 const minecraft = MinecraftData(mcVersion)
@@ -19,6 +23,83 @@ const itemsCatalog = minecraft.itemsArray.map((item) => ({
 }))
 
 const recipesCache = new Map()
+const itemTextureMap = new Map()
+const blockTextureMap = new Map()
+const inlineTextureMap = new Map()
+
+function loadTextureIndex (filePath, targetMap) {
+  if (!fs.existsSync(filePath)) return
+  try {
+    const raw = fs.readFileSync(filePath, 'utf8')
+    const entries = JSON.parse(raw)
+    if (!Array.isArray(entries)) return
+    for (const entry of entries) {
+      if (!entry || typeof entry.name !== 'string') continue
+      if (!entry.texture || typeof entry.texture !== 'string') continue
+      targetMap.set(entry.name, entry.texture)
+    }
+  } catch (err) {
+    console.warn('Failed to load texture index:', err && err.message ? err.message : err)
+  }
+}
+
+function loadInlineTextures (filePath, targetMap) {
+  if (!fs.existsSync(filePath)) return
+  try {
+    const raw = fs.readFileSync(filePath, 'utf8')
+    const entries = JSON.parse(raw)
+    if (!Array.isArray(entries)) return
+    for (const entry of entries) {
+      if (!entry || typeof entry.name !== 'string') continue
+      if (!entry.texture || typeof entry.texture !== 'string') continue
+      if (!entry.texture.startsWith('data:image')) continue
+      targetMap.set(entry.name, entry.texture)
+    }
+  } catch (err) {
+    console.warn('Failed to load inline textures:', err && err.message ? err.message : err)
+  }
+}
+
+function resolveTextureFile (texture) {
+  if (!texture || typeof texture !== 'string') return null
+  let cleaned = texture.replace(/^minecraft:/, '').replace(/^textures\//, '')
+  cleaned = cleaned.replace(/^\/+/, '')
+
+  const tryPath = (root, name) => {
+    if (!name) return null
+    const filePath = path.join(root, `${name}.png`)
+    return fs.existsSync(filePath) ? filePath : null
+  }
+
+  if (cleaned.startsWith('block/')) return tryPath(blockTextureRoot, cleaned.slice('block/'.length))
+  if (cleaned.startsWith('blocks/')) return tryPath(blockTextureRoot, cleaned.slice('blocks/'.length))
+  if (cleaned.startsWith('item/')) return tryPath(textureRoot, cleaned.slice('item/'.length))
+  if (cleaned.startsWith('items/')) return tryPath(textureRoot, cleaned.slice('items/'.length))
+
+  if (cleaned.includes('/')) {
+    const parts = cleaned.split('/')
+    const last = parts[parts.length - 1]
+    return tryPath(textureRoot, last) || tryPath(blockTextureRoot, last)
+  }
+
+  return tryPath(textureRoot, cleaned) || tryPath(blockTextureRoot, cleaned)
+}
+
+function serveInlineTexture (res, dataUrl) {
+  const base64 = dataUrl.split(',')[1]
+  if (!base64) {
+    res.writeHead(404)
+    res.end('Not found')
+    return
+  }
+  const buffer = Buffer.from(base64, 'base64')
+  res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'no-store' })
+  res.end(buffer)
+}
+
+loadTextureIndex(itemsTexturesPath, itemTextureMap)
+loadTextureIndex(blocksTexturesPath, blockTextureMap)
+loadInlineTextures(textureContentPath, inlineTextureMap)
 
 function buildRecipe (itemName) {
   if (!itemName) return null
@@ -175,6 +256,11 @@ const server = http.createServer((req, res) => {
     const raw = decodeURIComponent(url.pathname.slice('/item/'.length))
     const base = raw.replace(/\.png$/i, '')
     const key = base.toLowerCase().replace(/[^a-z0-9_\-]/g, '')
+    const inline = inlineTextureMap.get(key)
+    if (inline) {
+      serveInlineTexture(res, inline)
+      return
+    }
     const itemPath = path.join(textureRoot, `${key}.png`)
     const blockPath = path.join(blockTextureRoot, `${key}.png`)
     if (fs.existsSync(itemPath)) {
@@ -182,6 +268,12 @@ const server = http.createServer((req, res) => {
     } else if (fs.existsSync(blockPath)) {
       serveFile(res, blockPath)
     } else {
+      const mappedTexture = itemTextureMap.get(key) || blockTextureMap.get(key)
+      const resolved = resolveTextureFile(mappedTexture)
+      if (resolved) {
+        serveFile(res, resolved)
+        return
+      }
       serveFile(res, placeholderPath)
     }
     return
