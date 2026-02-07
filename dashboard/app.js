@@ -14,6 +14,9 @@ const gridMeta = document.getElementById('gridMeta')
 const chartLegend = document.getElementById('chartLegend')
 const botApiBase = window.BOT_API || 'http://localhost:3010'
 const trackedList = document.getElementById('trackedList')
+const searchAllSortSelect = document.getElementById('searchAllSortSelect')
+const trackingSortSelect = document.getElementById('trackingSortSelect')
+const orderConfigStatus = document.getElementById('orderConfigStatus')
 const craftSummary = document.getElementById('craftSummary')
 const craftList = document.getElementById('craftList')
 const trackAliasInput = document.getElementById('trackAliasInput')
@@ -23,12 +26,20 @@ const chartModeControls = document.getElementById('chartModeControls')
 const searchAllButton = document.getElementById('searchAllButton')
 const searchAllStatus = document.getElementById('searchAllStatus')
 const snapshotPanel = document.getElementById('snapshotPanel')
-const groupedPanel = document.getElementById('groupedPanel')
 const groupedList = document.getElementById('groupedList')
 const groupedMeta = document.getElementById('groupedMeta')
+const groupedView = document.getElementById('groupedView')
+const groupedChart = document.getElementById('groupedChart')
+const groupedChartCtx = groupedChart ? groupedChart.getContext('2d') : null
+const groupedChartLegend = document.getElementById('groupedChartLegend')
+const groupedSearchInput = document.getElementById('groupedSearch')
+const groupedSearchResults = document.getElementById('groupedSearchResults')
 const productView = document.getElementById('productView')
 const marginsView = document.getElementById('marginsView')
 const marginsHoursInput = document.getElementById('marginsHours')
+const marginsSearchInput = document.getElementById('marginsSearch')
+const marginsSearchResults = document.getElementById('marginsSearchResults')
+const marginsUpdateNotice = document.getElementById('marginsUpdateNotice')
 const marginsList = document.getElementById('marginsList')
 const tabs = Array.from(document.querySelectorAll('[data-tab]'))
 const alertsWebhookInput = document.getElementById('alertsWebhook')
@@ -61,10 +72,29 @@ let chartMode = 'snapshot'
 let allPages = []
 let groupedRuns = []
 let latestGroupedRun = null
+let groupedOrdersByItem = new Map()
+let groupedItemCounts = new Map()
+let loadingAllPages = false
 let marginsHours = 24
+let marginRowsCache = []
+let marginTrackingPendingKeys = new Set()
+let marginMoveNotice = null
+let transientTrackEntries = []
 let alertsConfig = { webhookUrl: '', rules: [] }
 let alertsTab = 'product'
+let activeTab = 'product'
 let recipeCache = new Map()
+const orderSortOptionsDefault = [
+  { key: 'most_paid', label: 'Most Paid' },
+  { key: 'most_delivered', label: 'Most Delivered' },
+  { key: 'recently_listed', label: 'Recently Listed' },
+  { key: 'most_money_per_item', label: 'Most Money Per Item' }
+]
+let orderSortOptions = [...orderSortOptionsDefault]
+let orderConfig = {
+  searchAllSort: 'recently_listed',
+  trackingSort: 'most_money_per_item'
+}
 
 function formatPrice (value) {
   if (value >= 1_000_000_000) return `$${(value / 1_000_000_000).toFixed(1)}B`
@@ -99,6 +129,106 @@ function parseNumberOrNull (value) {
   if (value == null || value === '') return null
   const parsed = Number(value)
   return Number.isFinite(parsed) ? parsed : null
+}
+
+function normalizeSortKey (value, fallback) {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : ''
+  if (orderSortOptions.some((option) => option.key === normalized)) return normalized
+  return fallback
+}
+
+function setOrderConfigStatus (message, isError = false) {
+  if (!orderConfigStatus) return
+  orderConfigStatus.textContent = message || ''
+  orderConfigStatus.style.color = isError ? '#fca5a5' : ''
+}
+
+function renderOrderConfigSelectors () {
+  const selectors = [searchAllSortSelect, trackingSortSelect]
+  selectors.forEach((selectEl) => {
+    if (!selectEl) return
+    const current = selectEl.value
+    selectEl.innerHTML = orderSortOptions
+      .map((option) => `<option value="${option.key}">${option.label}</option>`)
+      .join('')
+    if (current) {
+      selectEl.value = normalizeSortKey(current, orderSortOptions[0]?.key || '')
+    }
+  })
+
+  if (searchAllSortSelect) {
+    searchAllSortSelect.value = normalizeSortKey(
+      orderConfig.searchAllSort,
+      'recently_listed'
+    )
+  }
+  if (trackingSortSelect) {
+    trackingSortSelect.value = normalizeSortKey(
+      orderConfig.trackingSort,
+      'most_money_per_item'
+    )
+  }
+}
+
+async function loadOrderConfig () {
+  if (!searchAllSortSelect || !trackingSortSelect) return
+  try {
+    const res = await fetch(`${botApiBase}/order-config`)
+    if (!res.ok) throw new Error('Order config unavailable')
+    const data = await res.json()
+    const options = Array.isArray(data.options) && data.options.length > 0
+      ? data.options
+      : orderSortOptionsDefault
+    orderSortOptions = options
+      .map((option) => ({
+        key: option.key,
+        label: option.label
+      }))
+      .filter((option) => option.key && option.label)
+    if (orderSortOptions.length === 0) {
+      orderSortOptions = [...orderSortOptionsDefault]
+    }
+    orderConfig = {
+      searchAllSort: normalizeSortKey(data.searchAllSort, 'recently_listed'),
+      trackingSort: normalizeSortKey(data.trackingSort, 'most_money_per_item')
+    }
+    renderOrderConfigSelectors()
+    setOrderConfigStatus('Order configuration loaded')
+  } catch (err) {
+    orderSortOptions = [...orderSortOptionsDefault]
+    orderConfig = {
+      searchAllSort: 'recently_listed',
+      trackingSort: 'most_money_per_item'
+    }
+    renderOrderConfigSelectors()
+    setOrderConfigStatus('Order configuration unavailable', true)
+  }
+}
+
+async function saveOrderConfig () {
+  if (!searchAllSortSelect || !trackingSortSelect) return
+  const payload = {
+    searchAllSort: normalizeSortKey(searchAllSortSelect.value, orderConfig.searchAllSort),
+    trackingSort: normalizeSortKey(trackingSortSelect.value, orderConfig.trackingSort)
+  }
+  try {
+    setOrderConfigStatus('Saving order configuration...')
+    const res = await fetch(`${botApiBase}/order-config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    })
+    if (!res.ok) throw new Error('Failed to save')
+    const data = await res.json()
+    orderConfig = {
+      searchAllSort: normalizeSortKey(data.searchAllSort, payload.searchAllSort),
+      trackingSort: normalizeSortKey(data.trackingSort, payload.trackingSort)
+    }
+    renderOrderConfigSelectors()
+    setOrderConfigStatus('Order configuration saved')
+  } catch (err) {
+    setOrderConfigStatus('Failed to save order configuration', true)
+  }
 }
 
 
@@ -290,6 +420,8 @@ function pickBestOrder (orders) {
 
 function buildGroupedRuns () {
   const runsMap = new Map()
+  const ordersByItem = new Map()
+  const countsByItem = new Map()
   for (const page of allPages || []) {
     if (!page || !page.ts) continue
     const runId = page.runId || page.runTs || page.ts
@@ -309,20 +441,47 @@ function buildGroupedRuns () {
     const slots = page.slots || []
     for (const slot of slots) {
       if (!slot?.order || !slot?.item) continue
-      const key = slot.item.name || getItemKey(slot.item)
+      const key = normalizeItemKey(slot.item.name || getItemKey(slot.item))
       if (!key) continue
+      const pageTs = page.ts || runTs || null
+      const amountOrderedRaw = Number(slot.order.amountOrdered)
+      const amountDeliveredRaw = Number(slot.order.amountDelivered)
+      const amountOrdered = Number.isFinite(amountOrderedRaw) ? amountOrderedRaw : 0
+      const amountDelivered = Number.isFinite(amountDeliveredRaw) ? amountDeliveredRaw : 0
+      const priceRaw = Number(slot.order.price)
+      const price = Number.isFinite(priceRaw) ? priceRaw : null
       const entry = run.items.get(key) || {
         key,
         name: slot.item.displayName || slot.item.name || key,
         orders: []
       }
       entry.orders.push({
-        price: slot.order.price,
-        amountOrdered: slot.order.amountOrdered,
-        amountDelivered: slot.order.amountDelivered,
+        price: price ?? 0,
+        amountOrdered,
+        amountDelivered,
         userName: slot.order.userName
       })
       run.items.set(key, entry)
+
+      if (price != null) {
+        const bucket = ordersByItem.get(key) || []
+        bucket.push({
+          key,
+          name: slot.item.displayName || slot.item.name || key,
+          ts: pageTs,
+          runId,
+          page: Number(page.page) || 1,
+          slot: Number.isFinite(Number(slot.slot)) ? Number(slot.slot) : null,
+          userName: slot.order.userName || '—',
+          price,
+          amountOrdered,
+          amountDelivered,
+          totalOrdered: price * amountOrdered,
+          totalDelivered: price * amountDelivered
+        })
+        ordersByItem.set(key, bucket)
+        countsByItem.set(key, (countsByItem.get(key) || 0) + 1)
+      }
     }
 
     runsMap.set(runId, run)
@@ -343,6 +502,8 @@ function buildGroupedRuns () {
   runs.sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime())
   groupedRuns = runs
   latestGroupedRun = runs.length > 0 ? runs[runs.length - 1] : null
+  groupedOrdersByItem = ordersByItem
+  groupedItemCounts = countsByItem
 }
 
 function getGroupedSeries () {
@@ -398,6 +559,7 @@ function setSelectedProduct (item) {
   loadRecipeForSelected()
   renderChart()
   renderActiveSnapshot()
+  renderGroupedSummary()
   renderAlerts()
 }
 
@@ -470,12 +632,29 @@ async function applyAlias (productKey, value) {
 
 function renderTrackedList () {
   trackedList.innerHTML = ''
-  if (!trackedItems || trackedItems.length === 0) {
+
+  const transient = transientTrackEntries.filter((entry) => entry && entry.key)
+  for (const entry of transient) {
+    const item = itemsCatalog.find((i) => i.name === entry.key)
+    const displayName = item?.displayName || entry.name || entry.key
+    const wrapper = document.createElement('div')
+    wrapper.className = `tracked-item transient${entry.fading ? ' fading' : ''}`
+    wrapper.innerHTML = `
+      <div class="item-thumb"><img src="${itemIconUrl(item || { name: entry.key })}" alt="" /></div>
+      <div>
+        <div><strong>${displayName}</strong></div>
+        <div class="meta">Track once queued</div>
+      </div>
+    `
+    trackedList.appendChild(wrapper)
+  }
+
+  if ((!trackedItems || trackedItems.length === 0) && transient.length === 0) {
     trackedList.innerHTML = '<div class="meta">No tracked items</div>'
     return
   }
 
-  for (const entry of trackedItems) {
+  for (const entry of (trackedItems || [])) {
     const item = itemsCatalog.find((i) => i.name === entry.key)
     const displayName = item?.displayName || entry.key
     const wrapper = document.createElement('div')
@@ -551,10 +730,12 @@ function renderRangeControls () {
 
 function renderChartModeControls () {
   if (!chartModeControls) return
+  if (chartMode !== 'snapshot') {
+    chartMode = 'snapshot'
+  }
   chartModeControls.innerHTML = ''
   const modes = [
-    { label: 'Snapshot', value: 'snapshot' },
-    { label: 'Grouped', value: 'grouped' }
+    { label: 'Snapshot', value: 'snapshot' }
   ]
   for (const mode of modes) {
     const button = document.createElement('button')
@@ -576,21 +757,33 @@ function setChartMode (mode) {
   renderCraftSection()
   renderGroupedSummary()
   renderMargins()
-  if (snapshotPanel && groupedPanel) {
-    snapshotPanel.hidden = chartMode === 'grouped'
-    groupedPanel.hidden = chartMode !== 'grouped'
+  if (snapshotPanel) {
+    snapshotPanel.hidden = false
   }
 }
 
 function setActiveTab (tab) {
+  activeTab = tab
   for (const button of tabs) {
     button.classList.toggle('active', button.dataset.tab === tab)
   }
   if (productView) productView.hidden = tab !== 'product'
   if (marginsView) marginsView.hidden = tab !== 'margins'
+  if (groupedView) groupedView.hidden = tab !== 'grouped'
   if (tab === 'margins') {
     renderMargins()
+    return
   }
+  if (tab === 'grouped') {
+    renderGroupedSummary()
+    return
+  }
+  if (chartMode !== 'snapshot') {
+    setChartMode('snapshot')
+    return
+  }
+  renderChart()
+  renderActiveSnapshot()
 }
 
 function setAlertsTab (tab) {
@@ -630,6 +823,160 @@ async function toggleTrack (productKey, commandName) {
     }
   } catch (err) {
     console.error(err)
+  }
+}
+
+async function sendTrackRequest (productKey, options = {}) {
+  const key = normalizeItemKey(productKey)
+  if (!key) return false
+  const once = Boolean(options.once)
+  const endpoint = once ? 'track-once' : 'track'
+  const payload = { productKey: key }
+  if (options.commandName) {
+    payload.commandName = String(options.commandName).trim()
+  }
+  const res = await fetch(`${botApiBase}/${endpoint}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  })
+  return res.ok
+}
+
+function getMarginRankMap (rows) {
+  const map = new Map()
+  const list = Array.isArray(rows) ? rows : []
+  for (let i = 0; i < list.length; i += 1) {
+    const key = normalizeItemKey(list[i]?.key)
+    if (!key || map.has(key)) continue
+    map.set(key, i + 1)
+  }
+  return map
+}
+
+function showMarginMoveNotice (itemKey, fromRank, toRank, targetKey = '') {
+  if (!itemKey || !Number.isFinite(fromRank) || !Number.isFinite(toRank)) return
+  if (toRank <= fromRank) return
+  marginMoveNotice = {
+    key: normalizeItemKey(itemKey),
+    from: fromRank,
+    to: toRank,
+    targetKey: normalizeItemKey(targetKey),
+    expiresAt: Date.now() + 6000
+  }
+  setTimeout(() => {
+    if (!marginMoveNotice) return
+    if (Date.now() >= marginMoveNotice.expiresAt) {
+      marginMoveNotice = null
+      if (activeTab === 'margins') {
+        renderMargins()
+      }
+    }
+  }, 6200)
+}
+
+function addTransientTrackEntries (keys) {
+  const uniqueKeys = [...new Set((keys || []).map((key) => normalizeItemKey(key)).filter(Boolean))]
+  for (const key of uniqueKeys) {
+    const id = `transient_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`
+    const entry = {
+      id,
+      key,
+      name: getGroupedDisplayName(key),
+      fading: false
+    }
+    transientTrackEntries.unshift(entry)
+    setTimeout(() => {
+      const target = transientTrackEntries.find((item) => item.id === id)
+      if (!target) return
+      target.fading = true
+      renderTrackedList()
+    }, 4000)
+    setTimeout(() => {
+      transientTrackEntries = transientTrackEntries.filter((item) => item.id !== id)
+      renderTrackedList()
+    }, 5000)
+  }
+  renderTrackedList()
+}
+
+function sleep (ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function waitForQueueCompletion (keys, timeoutMs = 60000) {
+  const targetKeys = new Set((keys || []).map((key) => normalizeItemKey(key)).filter(Boolean))
+  if (targetKeys.size === 0) return true
+
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const res = await fetch(`${botApiBase}/queue`)
+      if (res.ok) {
+        const data = await res.json()
+        const inFlight = new Set()
+        if (Array.isArray(data.pending)) {
+          for (const key of data.pending) {
+            inFlight.add(normalizeItemKey(key))
+          }
+        }
+        if (data.current) {
+          inFlight.add(normalizeItemKey(data.current))
+        }
+        const stillRunning = [...targetKeys].some((key) => inFlight.has(key))
+        if (!stillRunning) return true
+      }
+    } catch (err) {
+      // Keep polling.
+    }
+    await sleep(1200)
+  }
+
+  return false
+}
+
+async function trackProductsBatch (productKeys, options = {}) {
+  const uniqueKeys = [...new Set((productKeys || []).map((key) => normalizeItemKey(key)).filter(Boolean))]
+  if (uniqueKeys.length === 0) return
+  const highlightKeys = [
+    ...uniqueKeys,
+    ...((options.highlightKeys || []).map((key) => normalizeItemKey(key)).filter(Boolean))
+  ]
+  const rankBefore = getMarginRankMap(marginRowsCache)
+  if (options.once) {
+    addTransientTrackEntries(uniqueKeys)
+  }
+  highlightKeys.forEach((key) => marginTrackingPendingKeys.add(key))
+  if (activeTab === 'margins') {
+    await renderMargins()
+  }
+
+  try {
+    for (const key of uniqueKeys) {
+      try {
+        await sendTrackRequest(key, options)
+      } catch (err) {
+        console.error(err)
+      }
+    }
+    await waitForQueueCompletion(uniqueKeys)
+    await loadQueueState()
+    await loadSnapshots()
+    await loadAllPages()
+  } finally {
+    highlightKeys.forEach((key) => marginTrackingPendingKeys.delete(key))
+    await renderMargins()
+    const anchorKey = normalizeItemKey(options.anchorKey)
+    if (anchorKey) {
+      const rankAfter = getMarginRankMap(marginRowsCache)
+      const fromRank = rankBefore.get(anchorKey)
+      const toRank = rankAfter.get(anchorKey)
+      if (Number.isFinite(fromRank) && Number.isFinite(toRank) && toRank > fromRank) {
+        const targetRow = marginRowsCache[toRank - 1]
+        showMarginMoveNotice(anchorKey, fromRank, toRank, targetRow?.key || '')
+        await renderMargins()
+      }
+    }
   }
 }
 
@@ -692,6 +1039,9 @@ async function loadSnapshots () {
 
     renderChart()
     renderActiveSnapshot()
+    if (activeTab === 'margins') {
+      renderMargins()
+    }
   } catch (err) {
     console.error(err)
   }
@@ -898,11 +1248,14 @@ async function loadQueueState () {
 }
 
 async function loadAllPages () {
+  if (loadingAllPages) return
+  loadingAllPages = true
   try {
     const res = await fetch('/api/all')
     const data = await res.json()
     allPages = Array.isArray(data) ? data : []
     buildGroupedRuns()
+    renderGroupedSearch()
     renderGroupedSummary()
     if (chartMode === 'grouped') {
       renderChart()
@@ -915,8 +1268,13 @@ async function loadAllPages () {
     allPages = []
     groupedRuns = []
     latestGroupedRun = null
+    groupedOrdersByItem = new Map()
+    groupedItemCounts = new Map()
+    renderGroupedSearch()
     renderGroupedSummary()
     renderMargins()
+  } finally {
+    loadingAllPages = false
   }
 }
 
@@ -930,6 +1288,9 @@ async function loadSearchAllStatus () {
     searchAllStatus.textContent = data.running ? 'Scanning…' : `Last scan: ${last}`
     if (searchAllButton) {
       searchAllButton.disabled = Boolean(data.running)
+    }
+    if (data.running) {
+      await loadAllPages()
     }
   } catch (err) {
     searchAllStatus.textContent = 'Search-all unavailable'
@@ -951,37 +1312,384 @@ async function triggerSearchAll () {
   }
 }
 
-function renderGroupedSummary () {
-  if (!groupedList || !groupedMeta) return
-  groupedList.innerHTML = ''
-  if (!latestGroupedRun) {
-    groupedMeta.textContent = 'No grouped scans yet. Run "Search all orders".'
-    groupedList.innerHTML = '<div class="meta">No grouped data.</div>'
+function getGroupedDisplayName (key) {
+  const normalized = normalizeItemKey(key)
+  if (!normalized) return key || '—'
+  const fromCatalog = itemsCatalog.find((item) => item.name === normalized)
+  if (fromCatalog?.displayName) return fromCatalog.displayName
+  const records = groupedOrdersByItem.get(normalized) || []
+  if (records.length > 0) {
+    const named = records.find((record) => record.name)
+    if (named?.name) return named.name
+  }
+  return normalized
+}
+
+function getGroupedProductRecords (productKey = selectedProduct?.key) {
+  const normalized = normalizeItemKey(productKey)
+  if (!normalized) return []
+  const records = [...(groupedOrdersByItem.get(normalized) || [])]
+  records.sort((a, b) => {
+    if (b.price !== a.price) return b.price - a.price
+    const aTs = a.ts ? new Date(a.ts).getTime() : 0
+    const bTs = b.ts ? new Date(b.ts).getTime() : 0
+    return bTs - aTs
+  })
+  return records
+}
+
+function getGroupedPriceStats (productKey, sinceMs) {
+  const records = getGroupedProductRecords(productKey)
+  if (!records.length) return null
+  const cutoff = Number.isFinite(sinceMs) && sinceMs > 0 ? Date.now() - sinceMs : null
+
+  let min = Infinity
+  let max = -Infinity
+  let sum = 0
+  let count = 0
+  let latestTs = 0
+  let latestPrice = null
+
+  for (const record of records) {
+    const price = Number(record.price)
+    if (!Number.isFinite(price)) continue
+    const tsMs = record.ts ? new Date(record.ts).getTime() : 0
+    if (cutoff != null && tsMs && tsMs < cutoff) continue
+
+    sum += price
+    count += 1
+    if (price < min) min = price
+    if (price > max) max = price
+    if (tsMs >= latestTs) {
+      latestTs = tsMs
+      latestPrice = price
+    }
+  }
+
+  if (count === 0) return null
+  return {
+    avg: sum / count,
+    min,
+    max,
+    latest: latestPrice,
+    count
+  }
+}
+
+function getTrackedPriceStats (productKey, sinceMs) {
+  const normalized = normalizeItemKey(productKey)
+  if (!normalized) return null
+  const cutoff = Number.isFinite(sinceMs) && sinceMs > 0 ? Date.now() - sinceMs : null
+  const sourceSnapshots = Array.isArray(snapshots) ? snapshots : []
+
+  let min = Infinity
+  let max = -Infinity
+  let sum = 0
+  let count = 0
+  let latestTs = 0
+  let latestPrice = null
+
+  for (const snapshot of sourceSnapshots) {
+    if (!snapshot) continue
+    if (normalizeItemKey(snapshot.productKey) !== normalized) continue
+    const tsMs = snapshot.ts ? new Date(snapshot.ts).getTime() : 0
+    if (cutoff != null && tsMs && tsMs < cutoff) continue
+
+    const top = getMaxSlot(snapshot, normalized)
+    const price = Number(top?.price)
+    if (!Number.isFinite(price)) continue
+
+    sum += price
+    count += 1
+    if (price < min) min = price
+    if (price > max) max = price
+    if (tsMs >= latestTs) {
+      latestTs = tsMs
+      latestPrice = price
+    }
+  }
+
+  if (count === 0) return null
+  return {
+    avg: sum / count,
+    min,
+    max,
+    latest: latestPrice,
+    count
+  }
+}
+
+function getPreferredPriceStats (productKey, sinceMs) {
+  const trackedStats = getTrackedPriceStats(productKey, sinceMs)
+  if (trackedStats) {
+    return {
+      ...trackedStats,
+      source: 'tracked'
+    }
+  }
+  const groupedStats = getGroupedPriceStats(productKey, sinceMs)
+  if (!groupedStats) return null
+  return {
+    ...groupedStats,
+    source: 'grouped'
+  }
+}
+
+function getGroupedSearchCandidates (query) {
+  const text = String(query || '').trim().toLowerCase()
+  const tokens = text.split(/[\s,]+/).filter((token) => token.length > 0)
+
+  if (tokens.length === 0) {
+    const items = Array.from(groupedItemCounts.entries())
+      .map(([key, count]) => ({
+        key,
+        displayName: getGroupedDisplayName(key),
+        count
+      }))
+      .sort((a, b) => b.count - a.count || a.displayName.localeCompare(b.displayName))
+    return items.slice(0, 40)
+  }
+
+  const fromCatalog = itemsCatalog
+    .filter((item) => matchesQuery(`${item.displayName} ${item.name}`, tokens))
+    .map((item) => {
+      const key = normalizeItemKey(item.name)
+      return {
+        key,
+        displayName: item.displayName || item.name,
+        count: groupedItemCounts.get(key) || 0
+      }
+    })
+    .filter((entry) => entry.count > 0)
+    .sort((a, b) => b.count - a.count || a.displayName.localeCompare(b.displayName))
+  return fromCatalog.slice(0, 40)
+}
+
+function renderGroupedSearch () {
+  if (!groupedSearchResults) return
+  groupedSearchResults.innerHTML = ''
+  const query = groupedSearchInput ? groupedSearchInput.value : ''
+  const candidates = getGroupedSearchCandidates(query)
+
+  if (candidates.length === 0) {
+    groupedSearchResults.innerHTML = '<div class="meta">No grouped matches.</div>'
     return
   }
 
-  groupedMeta.textContent = `Last scan: ${new Date(latestGroupedRun.ts).toLocaleString()} • Pages: ${latestGroupedRun.pages}`
-  const items = Array.from(latestGroupedRun.items.values()).filter((entry) => entry.best)
-  items.sort((a, b) => (b.best?.score || 0) - (a.best?.score || 0))
-
-  for (const entry of items) {
-    const catalogItem = itemsCatalog.find((item) => item.name === entry.key)
-    const displayName = catalogItem?.displayName || entry.name || entry.key
-    const remaining = entry.best.remaining
-    const row = document.createElement('div')
-    row.className = 'grouped-item'
-    row.innerHTML = `
-      <div class="item-thumb"><img src="${itemIconUrl({ name: entry.key })}" alt="" /></div>
-      <div>
-        <div class="item-name">${displayName}</div>
-        <div class="item-meta">Remaining: ${formatNumber(remaining)} • Orders: ${entry.ordersCount}</div>
-      </div>
-      <div class="item-price">${formatPrice(entry.best.price)}</div>
+  for (const candidate of candidates) {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'grouped-search-item'
+    if (selectedProduct?.key === candidate.key) {
+      button.classList.add('active')
+    }
+    button.innerHTML = `
+      <span>${candidate.displayName}</span>
+      <span>${candidate.count}</span>
     `
-    row.addEventListener('click', () => {
-      setSelectedProduct({ name: entry.key, displayName })
-      setChartMode('grouped')
+    button.addEventListener('click', () => {
+      setSelectedProduct({ name: candidate.key, displayName: candidate.displayName })
+      if (activeTab !== 'grouped') {
+        setActiveTab('grouped')
+      } else {
+        renderGroupedSummary()
+      }
     })
+    groupedSearchResults.appendChild(button)
+  }
+}
+
+function getMarginsSearchCandidates (query) {
+  const text = String(query || '').trim().toLowerCase()
+  const tokens = text.split(/[\s,]+/).filter((token) => token.length > 0)
+  const source = Array.isArray(marginRowsCache) ? marginRowsCache : []
+
+  if (tokens.length === 0) {
+    return source.slice(0, 40).map((row) => ({
+      key: normalizeItemKey(row.key),
+      displayName: row.displayName || getGroupedDisplayName(row.key),
+      margin: row.margin
+    }))
+  }
+
+  return source
+    .filter((row) => matchesQuery(`${row.displayName || row.name || row.key} ${row.key}`, tokens))
+    .slice(0, 40)
+    .map((row) => ({
+      key: normalizeItemKey(row.key),
+      displayName: row.displayName || getGroupedDisplayName(row.key),
+      margin: row.margin
+    }))
+}
+
+function renderMarginsSearch () {
+  if (!marginsSearchResults) return
+  marginsSearchResults.innerHTML = ''
+  const query = marginsSearchInput ? marginsSearchInput.value : ''
+  const candidates = getMarginsSearchCandidates(query)
+
+  if (candidates.length === 0) {
+    marginsSearchResults.innerHTML = '<div class="meta">No margin matches.</div>'
+    return
+  }
+
+  for (const candidate of candidates) {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'grouped-search-item'
+    if (selectedProduct?.key === candidate.key) {
+      button.classList.add('active')
+    }
+    button.innerHTML = `
+      <span>${candidate.displayName}</span>
+      <span>${candidate.margin >= 0 ? '+' : '-'}${formatPrice(Math.round(Math.abs(candidate.margin)))}</span>
+    `
+    button.addEventListener('click', () => {
+      if (marginsSearchInput) {
+        marginsSearchInput.value = candidate.displayName
+      }
+      setSelectedProduct({ name: candidate.key, displayName: candidate.displayName })
+      if (activeTab !== 'margins') {
+        setActiveTab('margins')
+      } else {
+        renderMargins()
+      }
+    })
+    marginsSearchResults.appendChild(button)
+  }
+}
+
+function renderGroupedRecordsChart (records) {
+  if (!groupedChart || !groupedChartCtx) return
+  const dpr = window.devicePixelRatio || 1
+  const rect = groupedChart.getBoundingClientRect()
+  groupedChart.width = rect.width * dpr
+  groupedChart.height = rect.height * dpr
+  groupedChartCtx.setTransform(1, 0, 0, 1, 0, 0)
+  groupedChartCtx.scale(dpr, dpr)
+  groupedChartCtx.clearRect(0, 0, rect.width, rect.height)
+
+  if (!Array.isArray(records) || records.length === 0) {
+    groupedChartCtx.fillStyle = '#666'
+    groupedChartCtx.font = '14px Space Grotesk, sans-serif'
+    groupedChartCtx.fillText('No grouped records for selected product', 12, 30)
+    if (groupedChartLegend) groupedChartLegend.textContent = 'Grouped chart: no data'
+    return
+  }
+
+  const series = [...records].sort((a, b) => {
+    const aTs = a.ts ? new Date(a.ts).getTime() : 0
+    const bTs = b.ts ? new Date(b.ts).getTime() : 0
+    if (aTs !== bTs) return aTs - bTs
+    return a.price - b.price
+  })
+  const prices = series.map((entry) => entry.price)
+  const maxPrice = Math.max(...prices, 1)
+  const minPrice = Math.min(...prices)
+  const avgPrice = prices.reduce((sum, value) => sum + value, 0) / prices.length
+
+  const padding = { left: 60, right: 20, top: 24, bottom: 36 }
+  const width = rect.width - padding.left - padding.right
+  const height = rect.height - padding.top - padding.bottom
+
+  const points = series.map((entry, idx) => {
+    const x = padding.left + (width * idx) / Math.max(series.length - 1, 1)
+    const y = padding.top + height - (height * entry.price) / maxPrice
+    return { x, y, idx, entry }
+  })
+
+  groupedChartCtx.strokeStyle = '#e3dccf'
+  groupedChartCtx.lineWidth = 1
+  groupedChartCtx.font = '12px Space Grotesk, sans-serif'
+  groupedChartCtx.fillStyle = '#6b6f76'
+
+  const yTicks = 4
+  for (let i = 0; i <= yTicks; i += 1) {
+    const y = padding.top + (height * i) / yTicks
+    groupedChartCtx.beginPath()
+    groupedChartCtx.moveTo(padding.left, y)
+    groupedChartCtx.lineTo(padding.left + width, y)
+    groupedChartCtx.stroke()
+    const priceLabel = formatPrice(Math.round(maxPrice * (1 - i / yTicks)))
+    groupedChartCtx.fillText(priceLabel, 8, y + 4)
+  }
+
+  const xTicks = Math.min(5, series.length - 1)
+  for (let i = 0; i <= xTicks; i += 1) {
+    const idx = Math.round((series.length - 1) * (i / Math.max(xTicks, 1)))
+    const x = padding.left + (width * idx) / Math.max(series.length - 1, 1)
+    groupedChartCtx.beginPath()
+    groupedChartCtx.moveTo(x, padding.top)
+    groupedChartCtx.lineTo(x, padding.top + height)
+    groupedChartCtx.stroke()
+    const label = formatAxisTime(series[idx].ts || Date.now())
+    const textWidth = groupedChartCtx.measureText(label).width
+    groupedChartCtx.fillText(label, x - textWidth / 2, padding.top + height + 20)
+  }
+
+  groupedChartCtx.strokeStyle = '#1f2933'
+  groupedChartCtx.lineWidth = 2
+  groupedChartCtx.beginPath()
+  points.forEach((point, idx) => {
+    if (idx === 0) groupedChartCtx.moveTo(point.x, point.y)
+    else groupedChartCtx.lineTo(point.x, point.y)
+  })
+  groupedChartCtx.stroke()
+
+  points.forEach((point) => {
+    groupedChartCtx.fillStyle = '#f05d3b'
+    groupedChartCtx.beginPath()
+    groupedChartCtx.arc(point.x, point.y, 3, 0, Math.PI * 2)
+    groupedChartCtx.fill()
+  })
+
+  if (groupedChartLegend) {
+    groupedChartLegend.textContent = `Records: ${series.length} • Max: ${formatPrice(Math.round(maxPrice))} • Min: ${formatPrice(Math.round(minPrice))} • Avg: ${formatPrice(Math.round(avgPrice))}`
+  }
+}
+
+function renderGroupedSummary () {
+  if (!groupedList || !groupedMeta) return
+  if (activeTab !== 'grouped') return
+
+  groupedList.innerHTML = ''
+  const records = getGroupedProductRecords(selectedProduct?.key)
+  renderGroupedSearch()
+
+  if (!selectedProduct?.key) {
+    groupedMeta.textContent = 'Select a product to view grouped records.'
+    groupedList.innerHTML = '<div class="meta">No selected product.</div>'
+    renderGroupedRecordsChart([])
+    return
+  }
+
+  if (records.length === 0) {
+    groupedMeta.textContent = 'No grouped records yet. Run "Search all orders".'
+    groupedList.innerHTML = '<div class="meta">No grouped data for this product.</div>'
+    renderGroupedRecordsChart([])
+    return
+  }
+
+  const latestTs = records.find((record) => record.ts)?.ts || null
+  groupedMeta.textContent = `Records: ${records.length} • Last seen: ${latestTs ? formatDateTime(latestTs) : '—'}`
+  renderGroupedRecordsChart(records)
+
+  const displayName = getGroupedDisplayName(selectedProduct.key)
+  const limitedRecords = records.slice(0, 1500)
+  for (const record of limitedRecords) {
+    const row = document.createElement('div')
+    row.className = 'grouped-record-row'
+    const timeLabel = record.ts ? formatDateTime(record.ts) : '—'
+    const slotLabel = record.slot == null ? '' : ` • Slot ${record.slot}`
+    row.innerHTML = `
+      <div class="grouped-record-main">
+        <div class="item-name">${displayName}</div>
+        <div class="item-meta">${record.userName} • ${timeLabel} • Page ${record.page}${slotLabel}</div>
+      </div>
+      <div class="grouped-record-price">${formatPrice(record.price)}</div>
+      <div class="grouped-record-qty">${formatNumber(record.amountDelivered)}/${formatNumber(record.amountOrdered)}</div>
+      <div class="grouped-record-total">${formatPrice(record.totalDelivered)}/${formatPrice(record.totalOrdered)}</div>
+    `
     groupedList.appendChild(row)
   }
 }
@@ -1108,91 +1816,208 @@ async function fetchRecipeCached (itemKey) {
   return promise
 }
 
-function averageGroupedPrice (productKey, sinceMs) {
-  if (!productKey) return null
-  const cutoff = Date.now() - sinceMs
-  let total = 0
-  let count = 0
-  for (const run of groupedRuns) {
-    if (new Date(run.ts).getTime() < cutoff) continue
-    const entry = run.items.get(productKey)
-    if (!entry?.best?.price) continue
-    total += entry.best.price
-    count += 1
-  }
-  return count > 0 ? total / count : null
-}
-
 async function renderMargins () {
   if (!marginsList) return
   marginsList.innerHTML = '<div class="meta">Loading margins…</div>'
   const run = latestGroupedRun
   if (!run) {
+    marginRowsCache = []
+    renderMarginsSearch()
     marginsList.innerHTML = '<div class="meta">Run a grouped scan to calculate margins.</div>'
+    if (marginsUpdateNotice) marginsUpdateNotice.hidden = true
     return
   }
 
   const hours = Number(marginsHours) || 24
   const sinceMs = hours * 60 * 60 * 1000
   const candidates = Array.from(run.items.values())
+  const formatQty = (value) => {
+    if (!Number.isFinite(value)) return '0'
+    if (Math.abs(value - Math.round(value)) < 1e-9) return `${Math.round(value)}`
+    return value.toFixed(2).replace(/\.?0+$/, '')
+  }
+  const sourceLabel = (source) => (source === 'tracked' ? 'tracked' : 'grouped')
 
   const rows = []
   for (const entry of candidates) {
-    const avgPrice = averageGroupedPrice(entry.key, sinceMs)
-    if (!avgPrice) continue
+    const productStats = getPreferredPriceStats(entry.key, sinceMs)
+    if (!productStats) continue
     const recipe = await fetchRecipeCached(entry.key)
     if (!recipe || !recipe.ingredients || recipe.ingredients.length === 0) continue
 
     let craftCost = 0
     let craftKnown = true
+    const materialDetails = []
     const resultCount = recipe.result?.count || 1
     for (const ingredient of recipe.ingredients) {
-      const avgIngredientPrice = averageGroupedPrice(ingredient.name, sinceMs)
-      if (avgIngredientPrice == null) {
+      const ingredientStats = getPreferredPriceStats(ingredient.name, sinceMs)
+      if (!ingredientStats) {
         craftKnown = false
         break
       }
       const qtyPerUnit = ingredient.count / resultCount
-      craftCost += avgIngredientPrice * qtyPerUnit
+      const unitPrice = ingredientStats.max
+      const totalCost = unitPrice * qtyPerUnit
+      craftCost += totalCost
+      materialDetails.push({
+        key: normalizeItemKey(ingredient.name),
+        displayName: ingredient.displayName || getGroupedDisplayName(ingredient.name),
+        qtyPerUnit,
+        unitPrice,
+        totalCost,
+        source: sourceLabel(ingredientStats.source)
+      })
     }
     if (!craftKnown) continue
-    const margin = avgPrice - craftCost
+    const sellPrice = productStats.max
+    const margin = sellPrice - craftCost
+    const key = normalizeItemKey(entry.key)
+    const displayName = getGroupedDisplayName(key)
     rows.push({
-      key: entry.key,
+      key,
+      displayName,
       name: entry.name,
-      avgPrice,
+      sellPrice,
       craftCost,
-      margin
+      margin,
+      productMax: productStats.max,
+      points: productStats.count,
+      sellSource: sourceLabel(productStats.source),
+      recipe,
+      materials: materialDetails
     })
   }
 
   rows.sort((a, b) => b.margin - a.margin)
+  marginRowsCache = rows
+  renderMarginsSearch()
+
+  const queryTokens = String(marginsSearchInput?.value || '')
+    .trim()
+    .toLowerCase()
+    .split(/[\s,]+/)
+    .filter((token) => token.length > 0)
+  const visibleRows = queryTokens.length > 0
+    ? rows.filter((row) => matchesQuery(`${row.displayName} ${row.key}`, queryTokens))
+    : rows
+
+  if (marginMoveNotice && marginMoveNotice.expiresAt < Date.now()) {
+    marginMoveNotice = null
+  }
+  if (marginsUpdateNotice) {
+    if (marginMoveNotice) {
+      marginsUpdateNotice.hidden = false
+      const name = getGroupedDisplayName(marginMoveNotice.key)
+      const targetName = marginMoveNotice.targetKey
+        ? getGroupedDisplayName(marginMoveNotice.targetKey)
+        : ''
+      marginsUpdateNotice.textContent = targetName && targetName !== name
+        ? `${name} moved down from #${marginMoveNotice.from} to #${marginMoveNotice.to} (below ${targetName})`
+        : `${name} moved down from #${marginMoveNotice.from} to #${marginMoveNotice.to}`
+    } else {
+      marginsUpdateNotice.hidden = true
+      marginsUpdateNotice.textContent = ''
+    }
+  }
+
   marginsList.innerHTML = ''
 
-  if (rows.length === 0) {
+  if (visibleRows.length === 0) {
     marginsList.innerHTML = '<div class="meta">No margins available for this window.</div>'
     return
   }
 
-  for (const row of rows.slice(0, 50)) {
-    const catalogItem = itemsCatalog.find((item) => item.name === row.key)
-    const displayName = catalogItem?.displayName || row.name || row.key
+  const header = document.createElement('div')
+  header.className = 'margin-header'
+  header.innerHTML = `
+    <div>Item</div>
+    <div>Sell Price</div>
+    <div>Material Cost</div>
+    <div>Margin</div>
+    <div>Actions</div>
+  `
+  marginsList.appendChild(header)
+
+  for (const row of visibleRows.slice(0, 80)) {
     const node = document.createElement('div')
     node.className = 'margin-row'
+    const isPendingRow = marginTrackingPendingKeys.has(row.key)
+    const isMovedDown = marginMoveNotice && marginMoveNotice.key === row.key && marginMoveNotice.expiresAt >= Date.now()
+    if (isPendingRow) node.classList.add('pending')
+    if (isMovedDown) node.classList.add('rank-moved-down')
+    const materialsHtml = row.materials
+      .map((material) => `
+        <div class="margin-material-chip${marginTrackingPendingKeys.has(material.key) ? ' pending' : ''}">
+          <div class="item-thumb"><img src="${itemIconUrl({ name: material.key })}" alt="" /></div>
+          <div class="margin-material-info">
+            <div class="margin-material-name">${material.displayName} x${formatQty(material.qtyPerUnit)}</div>
+            <div class="margin-material-meta">${formatPrice(Math.round(material.unitPrice))} (${material.source})</div>
+          </div>
+        </div>
+      `)
+      .join('')
+
     node.innerHTML = `
-      <div class="item-thumb"><img src="${itemIconUrl({ name: row.key })}" alt="" /></div>
-      <div>
-        <div class="item-name">${displayName}</div>
-        <div class="meta">Avg price (last ${hours}h)</div>
+      <div class="margin-row-main">
+        <div class="margin-item">
+          <div class="item-thumb"><img src="${itemIconUrl({ name: row.key })}" alt="" /></div>
+          <div>
+            <div class="item-name">${row.displayName}</div>
+            <div class="meta">Top sell (${hours}h) from ${row.sellSource} • samples ${row.points}</div>
+          </div>
+        </div>
+        <div class="margin-metric">
+          <div class="metric-label">Sell Price</div>
+          <div class="metric-value">${formatPrice(Math.round(row.sellPrice))}</div>
+        </div>
+        <div class="margin-metric">
+          <div class="metric-label">Material Cost</div>
+          <div class="metric-value">${formatPrice(Math.round(row.craftCost))}</div>
+        </div>
+        <div class="margin-metric">
+          <div class="metric-label">Margin</div>
+          <div class="metric-value ${row.margin >= 0 ? 'positive' : 'negative'}">${row.margin >= 0 ? '+' : '-'}${formatPrice(Math.round(Math.abs(row.margin)))}</div>
+        </div>
+        <div class="margin-actions">
+          <button data-action="item-once" type="button" ${isPendingRow ? 'disabled' : ''}>Track Item Once</button>
+          <button data-action="item-always" type="button" ${isPendingRow ? 'disabled' : ''}>Track Item Always</button>
+          <button data-action="materials-once" type="button" ${isPendingRow ? 'disabled' : ''}>Track Mats Once</button>
+          <button data-action="materials-always" type="button" ${isPendingRow ? 'disabled' : ''}>Track Mats Always</button>
+        </div>
       </div>
-      <div class="metric">${formatPrice(Math.round(row.avgPrice))}</div>
-      <div class="metric">${formatPrice(Math.round(row.craftCost))}</div>
-      <div class="metric">${row.margin >= 0 ? '+' : '-'}${formatPrice(Math.round(Math.abs(row.margin)))}</div>
+      <div class="margin-materials">
+        <div class="margin-materials-title">Materials used for material cost</div>
+        <div class="margin-materials-grid">${materialsHtml}</div>
+      </div>
     `
+
+    const actionButtons = node.querySelectorAll('.margin-actions button')
+    actionButtons.forEach((button) => {
+      button.addEventListener('click', async (event) => {
+        event.stopPropagation()
+        const action = button.getAttribute('data-action')
+        if (action === 'item-once') {
+          await trackProductsBatch([row.key], { once: true, anchorKey: row.key })
+          return
+        }
+        if (action === 'item-always') {
+          await trackProductsBatch([row.key], { once: false, anchorKey: row.key })
+          return
+        }
+        const materialKeys = row.materials.map((material) => material.key)
+        if (action === 'materials-once') {
+          await trackProductsBatch(materialKeys, { once: true, anchorKey: row.key, highlightKeys: [row.key] })
+          return
+        }
+        if (action === 'materials-always') {
+          await trackProductsBatch(materialKeys, { once: false, anchorKey: row.key, highlightKeys: [row.key] })
+        }
+      })
+    })
+
     node.addEventListener('click', () => {
-      setSelectedProduct({ name: row.key, displayName })
-      setActiveTab('product')
-      setChartMode('grouped')
+      setSelectedProduct({ name: row.key, displayName: row.displayName })
+      setActiveTab('grouped')
     })
     marginsList.appendChild(node)
   }
@@ -1441,11 +2266,13 @@ function renderActiveSnapshot () {
   if (chartMode === 'grouped') {
     const filtered = getFilteredGroupedSeries()
     if (filtered.length === 0) {
-      snapshotMeta.innerHTML = `
-        <div><strong>Grouped scan:</strong> —</div>
-        <div><strong>Product:</strong> ${selectedProduct?.name || selectedProduct?.key || '—'}</div>
-        <div><strong>Best price:</strong> n/a</div>
-      `
+      if (snapshotMeta) {
+        snapshotMeta.innerHTML = `
+          <div><strong>Grouped scan:</strong> —</div>
+          <div><strong>Product:</strong> ${selectedProduct?.name || selectedProduct?.key || '—'}</div>
+          <div><strong>Best price:</strong> n/a</div>
+        `
+      }
       updateProductLabels(null, { mode: 'grouped' })
       const fallbackSnapshot = snapshots.length > 0 ? snapshots[snapshots.length - 1] : { slots: [] }
       renderSearchResults(fallbackSnapshot)
@@ -1469,11 +2296,13 @@ function renderActiveSnapshot () {
     const remaining = max && Number.isFinite(max.amountOrdered) && Number.isFinite(max.amountDelivered)
       ? max.amountOrdered - max.amountDelivered
       : null
-    snapshotMeta.innerHTML = `
-      <div><strong>Grouped scan:</strong> ${new Date(snapshot.ts).toLocaleString()}</div>
-      <div><strong>Product:</strong> ${selectedProduct?.name || snapshot.productName || snapshot.productKey}</div>
-      <div><strong>Best price:</strong> ${max ? formatPrice(max.price) : 'n/a'} ${remaining != null ? `(remaining ${formatNumber(remaining)})` : ''}</div>
-    `
+    if (snapshotMeta) {
+      snapshotMeta.innerHTML = `
+        <div><strong>Grouped scan:</strong> ${new Date(snapshot.ts).toLocaleString()}</div>
+        <div><strong>Product:</strong> ${selectedProduct?.name || snapshot.productName || snapshot.productKey}</div>
+        <div><strong>Best price:</strong> ${max ? formatPrice(max.price) : 'n/a'} ${remaining != null ? `(remaining ${formatNumber(remaining)})` : ''}</div>
+      `
+    }
 
     updateProductLabels(snapshot, { mode: 'grouped' })
     const fallbackSnapshot = snapshots.length > 0 ? snapshots[snapshots.length - 1] : { slots: [] }
@@ -1487,11 +2316,13 @@ function renderActiveSnapshot () {
   const filtered = getFilteredSnapshots()
 
   if (filtered.length === 0) {
-    snapshotMeta.innerHTML = `
-      <div><strong>Snapshot:</strong> —</div>
-      <div><strong>Product:</strong> ${selectedProduct?.name || selectedProduct?.key || '—'}</div>
-      <div><strong>Max price:</strong> n/a</div>
-    `
+    if (snapshotMeta) {
+      snapshotMeta.innerHTML = `
+        <div><strong>Snapshot:</strong> —</div>
+        <div><strong>Product:</strong> ${selectedProduct?.name || selectedProduct?.key || '—'}</div>
+        <div><strong>Max price:</strong> n/a</div>
+      `
+    }
     updateProductLabels(null)
     renderSearchResults({ slots: [] })
     renderGrid(null)
@@ -1511,11 +2342,13 @@ function renderActiveSnapshot () {
   activeSnapshot = snapshot
 
   const max = getMaxSlot(snapshot)
-  snapshotMeta.innerHTML = `
-    <div><strong>Snapshot:</strong> ${new Date(snapshot.ts).toLocaleString()}</div>
-    <div><strong>Product:</strong> ${selectedProduct?.name || snapshot.productName || snapshot.productKey}</div>
-    <div><strong>Max price:</strong> ${max ? formatPrice(max.price) : 'n/a'}</div>
-  `
+  if (snapshotMeta) {
+    snapshotMeta.innerHTML = `
+      <div><strong>Snapshot:</strong> ${new Date(snapshot.ts).toLocaleString()}</div>
+      <div><strong>Product:</strong> ${selectedProduct?.name || snapshot.productName || snapshot.productKey}</div>
+      <div><strong>Max price:</strong> ${max ? formatPrice(max.price) : 'n/a'}</div>
+    `
+  }
 
   updateProductLabels(snapshot)
   renderSearchResults(snapshot)
@@ -1775,6 +2608,10 @@ searchInput.addEventListener('input', () => {
 })
 
 window.addEventListener('resize', () => {
+  if (activeTab === 'grouped') {
+    renderGroupedSummary()
+    return
+  }
   renderChart()
 })
 
@@ -1783,6 +2620,19 @@ async function init () {
   initSidebarSections()
   renderRangeControls()
   renderChartModeControls()
+  renderOrderConfigSelectors()
+  if (searchAllSortSelect) {
+    searchAllSortSelect.addEventListener('change', () => {
+      orderConfig.searchAllSort = normalizeSortKey(searchAllSortSelect.value, orderConfig.searchAllSort)
+      saveOrderConfig()
+    })
+  }
+  if (trackingSortSelect) {
+    trackingSortSelect.addEventListener('change', () => {
+      orderConfig.trackingSort = normalizeSortKey(trackingSortSelect.value, orderConfig.trackingSort)
+      saveOrderConfig()
+    })
+  }
   trackButton.addEventListener('click', () => {
     trackSelectedProduct()
   })
@@ -1837,6 +2687,20 @@ async function init () {
       })
     })
     setActiveTab('product')
+  }
+  if (groupedSearchInput) {
+    groupedSearchInput.addEventListener('input', () => {
+      if (activeTab === 'grouped') {
+        renderGroupedSearch()
+      }
+    })
+  }
+  if (marginsSearchInput) {
+    marginsSearchInput.addEventListener('input', () => {
+      if (activeTab === 'margins') {
+        renderMargins()
+      }
+    })
   }
   if (marginsHoursInput) {
     const initialHours = Number(marginsHoursInput.value)
@@ -1901,9 +2765,10 @@ async function init () {
   await loadSnapshots()
   await loadAllPages()
   await loadSearchAllStatus()
+  await loadOrderConfig()
   await loadAlertsConfig()
   setInterval(loadSnapshots, 30000)
-  setInterval(loadAllPages, 60000)
+  setInterval(loadAllPages, 15000)
   setInterval(loadQueueState, 15000)
   setInterval(loadSearchAllStatus, 15000)
 }

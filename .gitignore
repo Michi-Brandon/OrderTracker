@@ -25,7 +25,10 @@ pnpm-debug.log*
 *.pem
 
 # Logs
-.orders-alerts.json
+orders-alerts.json
+orders-aliases.json
+orders-tracked.json
+
 *.log
 
 # OS / editor
@@ -33,5 +36,3 @@ pnpm-debug.log*
 Thumbs.db
 .vscode/
 .idea/
-
-orders-alerts.json

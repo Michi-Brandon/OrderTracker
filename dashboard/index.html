@@ -42,13 +42,21 @@
           </div>
         </div>
 
-        <div class="sidebar-section" data-section="snapshot">
+        <div class="sidebar-section" data-section="orderConfig">
           <button class="section-header" type="button">
-            <span class="section-title">Snapshot</span>
+            <span class="section-title">Order Configuration</span>
             <span class="section-toggle" aria-hidden="true">▾</span>
           </button>
           <div class="section-body">
-            <div id="snapshotMeta" class="meta"></div>
+            <label class="field">
+              <span class="field-label">Search all sort</span>
+              <select id="searchAllSortSelect" class="alias-input config-select"></select>
+            </label>
+            <label class="field">
+              <span class="field-label">Tracking sort</span>
+              <select id="trackingSortSelect" class="alias-input config-select"></select>
+            </label>
+            <div id="orderConfigStatus" class="meta"></div>
           </div>
         </div>
 
@@ -71,6 +79,7 @@
         <div class="main-tabs">
           <button class="tab-button active" data-tab="product">Product</button>
           <button class="tab-button" data-tab="margins">Margins</button>
+          <button class="tab-button" data-tab="grouped">Grouped</button>
         </div>
 
         <div id="productView">
@@ -157,15 +166,6 @@
             <div id="grid" class="grid"></div>
           </section>
 
-          <section class="panel grouped-panel" id="groupedPanel" hidden>
-            <div class="panel-header">
-              <div>
-                <div class="panel-title">All Orders Summary</div>
-                <div id="groupedMeta" class="panel-subtitle"></div>
-              </div>
-            </div>
-            <div id="groupedList" class="grouped-list"></div>
-          </section>
         </div>
 
         <div id="marginsView" hidden>
@@ -176,13 +176,49 @@
                 <div class="panel-subtitle">Best profit based on grouped scans</div>
               </div>
               <div class="panel-actions">
+                <label class="search margins-search">
+                  <input id="marginsSearch" type="text" placeholder="Search margin item..." />
+                </label>
                 <label class="input-inline">
                   <span>Hours</span>
                   <input id="marginsHours" type="number" min="1" max="168" step="1" value="24" />
                 </label>
               </div>
             </div>
+            <div id="marginsSearchResults" class="grouped-search-results margins-search-results"></div>
+            <div id="marginsUpdateNotice" class="margins-notice" hidden></div>
             <div id="marginsList" class="margins-list"></div>
+          </section>
+        </div>
+
+        <div id="groupedView" hidden>
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <div class="panel-title">Grouped Product View</div>
+                <div class="panel-subtitle">All records found in Search All for the selected product</div>
+              </div>
+              <div class="panel-actions">
+                <label class="search grouped-search">
+                  <input id="groupedSearch" type="text" placeholder="Search grouped item..." />
+                </label>
+              </div>
+            </div>
+            <div id="groupedSearchResults" class="grouped-search-results"></div>
+            <div class="chart-wrap grouped-chart-wrap">
+              <canvas id="groupedChart"></canvas>
+            </div>
+            <div id="groupedChartLegend" class="legend"></div>
+          </section>
+
+          <section class="panel grouped-panel">
+            <div class="panel-header">
+              <div>
+                <div class="panel-title">All Records (High to Low)</div>
+                <div id="groupedMeta" class="panel-subtitle"></div>
+              </div>
+            </div>
+            <div id="groupedList" class="grouped-list grouped-records-list"></div>
           </section>
         </div>
       </main>

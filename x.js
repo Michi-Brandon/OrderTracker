@@ -51,11 +51,9 @@ const enableViewer = process.env.VIEWER !== '0'
 const enableOrders = true
 const ordersIntervalMs = Number(process.env.ORDERS_INTERVAL_MS || 60000)
 const ordersOpenTimeoutMs = Number(process.env.ORDERS_OPEN_TIMEOUT_MS || 15000)
-const searchAllOpenTimeoutMs = Number(process.env.ORDERS_SEARCH_ALL_OPEN_TIMEOUT_MS || Math.max(ordersOpenTimeoutMs * 4, 60000))
-const searchAllTimeoutMs = Number(process.env.ORDERS_SEARCH_ALL_TIMEOUT_MS || 300000)
-const searchAllRequestTimeoutMs = Number(process.env.ORDERS_SEARCH_ALL_REQUEST_TIMEOUT_MS || 600000)
 const searchAllPageDelayMinMs = Number(process.env.ORDERS_SEARCH_ALL_PAGE_DELAY_MIN_MS || 1000)
 const searchAllPageDelayMaxMs = Number(process.env.ORDERS_SEARCH_ALL_PAGE_DELAY_MAX_MS || 2000)
+const searchAllStallTimeoutMs = Number(process.env.ORDERS_SEARCH_ALL_STALL_TIMEOUT_MS || 12000)
 const ordersCloseDelayMs = Number(process.env.ORDERS_CLOSE_DELAY_MS || 800)
 const ordersStartDelayMs = Number(process.env.ORDERS_START_DELAY_MS || 7000)
 const ordersHumanDelayMinMs = Number(process.env.ORDERS_HUMAN_DELAY_MIN_MS || 300)
@@ -63,19 +61,29 @@ const ordersHumanDelayMaxMs = Number(process.env.ORDERS_HUMAN_DELAY_MAX_MS || 90
 const ordersSchedulerIntervalMs = Number(process.env.ORDERS_SCHEDULER_INTERVAL_MS || 1000)
 const ordersApiPort = Number(process.env.ORDERS_API_PORT || 3010)
 const ordersAutoTrack = process.env.ORDERS_AUTOTRACK !== '0'
-const ordersProductKey = process.env.ORDERS_PRODUCT || 'repeater'
 const ordersCommandPrefix = process.env.ORDERS_CMD_PREFIX || `/orders`
 const ordersMinMatches = Number(process.env.ORDERS_MIN_MATCHES || 3)
 const ordersPageSearchLimit = Number(process.env.ORDERS_PAGE_SEARCH_LIMIT || 6)
 const ordersPageDelayMs = Number(process.env.ORDERS_PAGE_DELAY_MS || 1200)
 const alertAverageWindowMs = Number(process.env.ALERT_AVG_WINDOW_MS || 86_400_000)
 const alertUserCooldownMs = Number(process.env.ALERT_USER_COOLDOWN_MS || 300_000)
+const orderSortKeys = new Set([
+  'most_paid',
+  'most_delivered',
+  'recently_listed',
+  'most_money_per_item'
+])
+const defaultOrderConfig = Object.freeze({
+  searchAllSort: 'recently_listed',
+  trackingSort: 'most_money_per_item'
+})
 
 const ordersLogPath = path.join(__dirname, 'orders-snapshots.jsonl')
 const ordersAllLogPath = path.join(__dirname, 'orders-all.jsonl')
 const ordersAliasesPath = path.join(__dirname, 'orders-aliases.json')
 const ordersTrackedPath = path.join(__dirname, 'orders-tracked.json')
 const alertsPath = path.join(__dirname, 'orders-alerts.json')
+const ordersConfigPath = path.join(__dirname, 'orders-config.json')
 
 const minecraft = MinecraftData(version)
 const enchantmentDict = minecraft.enchantmentsArray.reduce((acc, e) => {
@@ -109,10 +117,12 @@ let searchAllRunning = false
 let searchAllRunId = null
 let searchAllRunTs = null
 let searchAllLastRunTs = null
-let searchAllRequestedAt = null
-let searchAllStartedAt = null
 let searchAllScannerActive = false
 let alertsConfig = { webhookUrl: '', rules: [] }
+let ordersConfig = {
+  searchAllSort: defaultOrderConfig.searchAllSort,
+  trackingSort: defaultOrderConfig.trackingSort
+}
 let alertUserCooldown = new Map()
 const priceHistory = new Map()
 
@@ -125,6 +135,7 @@ const trackedOrder = []
 loadAliases()
 loadTrackedList()
 loadAlertsConfig()
+loadOrderConfig()
 loadSearchAllLastRun()
 seedPriceHistory()
 
@@ -139,9 +150,8 @@ bot.once('spawn', () => {
 
   startOrdersApiServer()
   setTimeout(() => {
-    const restored = rehydrateTrackedList()
-    if (!restored && ordersAutoTrack && ordersProductKey) {
-      trackProduct(ordersProductKey, { immediate: true })
+    if (ordersAutoTrack) {
+      rehydrateTrackedList()
     }
     startScheduler()
   }, ordersStartDelayMs)
@@ -210,6 +220,36 @@ function loadAlertsConfig () {
   }
 }
 
+function normalizeOrderSortKey (value, fallback) {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : ''
+  if (orderSortKeys.has(normalized)) return normalized
+  const safeFallback = typeof fallback === 'string' ? fallback.trim().toLowerCase() : ''
+  return orderSortKeys.has(safeFallback) ? safeFallback : defaultOrderConfig.searchAllSort
+}
+
+function loadOrderConfig () {
+  try {
+    if (!fs.existsSync(ordersConfigPath)) {
+      saveOrderConfig()
+      return
+    }
+    const raw = fs.readFileSync(ordersConfigPath, 'utf8')
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object') return
+    const searchAllSort = normalizeOrderSortKey(
+      parsed.searchAllSort || parsed.searchAll || parsed?.sort?.searchAll,
+      defaultOrderConfig.searchAllSort
+    )
+    const trackingSort = normalizeOrderSortKey(
+      parsed.trackingSort || parsed.tracking || parsed?.sort?.tracking,
+      defaultOrderConfig.trackingSort
+    )
+    ordersConfig = { searchAllSort, trackingSort }
+  } catch (err) {
+    console.warn('Failed to load orders config:', err && err.message ? err.message : err)
+  }
+}
+
 function loadSearchAllLastRun () {
   try {
     if (!fs.existsSync(ordersAllLogPath)) return
@@ -237,6 +277,14 @@ function saveAlertsConfig () {
     fs.writeFileSync(alertsPath, JSON.stringify(alertsConfig, null, 2), 'utf8')
   } catch (err) {
     console.warn('Failed to save alerts config:', err && err.message ? err.message : err)
+  }
+}
+
+function saveOrderConfig () {
+  try {
+    fs.writeFileSync(ordersConfigPath, JSON.stringify(ordersConfig, null, 2), 'utf8')
+  } catch (err) {
+    console.warn('Failed to save orders config:', err && err.message ? err.message : err)
   }
 }
 
@@ -359,6 +407,19 @@ function trackProduct (productKey, options = {}) {
   return key
 }
 
+function trackProductOnce (productKey, options = {}) {
+  const key = normalizeProductKey(productKey)
+  if (!key) return null
+
+  if (options.commandName) {
+    setAlias(key, options.commandName)
+  }
+
+  enqueueProduct(key)
+  processQueue()
+  return key
+}
+
 function untrackProduct (productKey) {
   const key = normalizeProductKey(productKey)
   if (!key) return false
@@ -410,12 +471,6 @@ function processQueue () {
   if (!enableOrders) return
   if (currentTask || ordersInFlight) return
   if (searchAllRequested && !searchAllRunning) {
-    if (searchAllRequestedAt && Date.now() - searchAllRequestedAt > searchAllRequestTimeoutMs) {
-      console.warn('Search all request timed out; clearing request.')
-      searchAllRequested = false
-      searchAllRequestedAt = null
-      return
-    }
     startSearchAll()
     return
   }
@@ -459,9 +514,7 @@ function issueOrdersCommand (productKey) {
 function startSearchAll () {
   if (searchAllRunning) return
   searchAllRequested = false
-  searchAllRequestedAt = null
   searchAllRunning = true
-  searchAllStartedAt = Date.now()
   searchAllRunId = `run_${Date.now()}_${Math.random().toString(16).slice(2, 6)}`
   searchAllRunTs = new Date().toISOString()
   currentTask = { type: 'searchAll', startedAt: Date.now() }
@@ -474,19 +527,6 @@ function startSearchAll () {
   const command = `${ordersCommandPrefix}`.trim()
   bot.chat(command)
   console.log(`Search all orders started: ${command}`)
-  ordersOpenTimeout = setTimeout(() => {
-    if (searchAllRunning) {
-      console.warn('Search all window timeout; aborting.')
-      searchAllRunning = false
-      searchAllRequested = false
-      searchAllRequestedAt = null
-      searchAllStartedAt = null
-      currentTask = null
-      ordersInFlight = false
-      expectOrdersWindow = false
-      processQueue()
-    }
-  }, searchAllOpenTimeoutMs)
 }
 
 function windowSignature (window) {
@@ -522,22 +562,13 @@ function getItemLoreText (item) {
     .filter((line) => line)
 }
 
-function slotHasNextLore (slot) {
-  if (!slot) return false
-  const lore = getItemLoreText(slot)
-  return lore.some((line) => {
-    const lowered = String(line).toLowerCase()
-    return lowered.includes('next page') || lowered.includes('next')
-  })
-}
-
 function hasNextArrow (window) {
   if (!window || !Array.isArray(window.slots)) return false
   const item = window.slots[53]
   if (!item) return false
   const name = String(item.name || '').toLowerCase()
   const label = getSlotLabel(item).toLowerCase()
-  return name.includes('arrow') && (label.includes('next') || slotHasNextLore(item))
+  return name.includes('arrow') || label.includes('arrow')
 }
 
 function hasNextArrowSlot (snapshotSlot, windowItem) {
@@ -548,10 +579,7 @@ function hasNextArrowSlot (snapshotSlot, windowItem) {
     getSlotLabel(windowItem) ||
     ''
   ).toLowerCase()
-  const lore = Array.isArray(snapshotSlot?.loreText) ? snapshotSlot.loreText : getItemLoreText(windowItem)
-  const loreHasNext = lore.some((line) => stripFormatting(line).toLowerCase().includes('next'))
-  const isArrow = name.includes('arrow') || label.includes('arrow')
-  return loreHasNext && (isArrow || label.includes('next'))
+  return name.includes('arrow') || label.includes('arrow')
 }
 
 const sortOptions = [
@@ -560,6 +588,9 @@ const sortOptions = [
   { key: 'recently_listed', label: 'Recently Listed' },
   { key: 'most_money_per_item', label: 'Most Money Per Item' }
 ]
+const sortOptionByKey = new Map(sortOptions.map((option) => [option.key, option]))
+const defaultSortDelayMinMs = 1000
+const defaultSortDelayMaxMs = 2000
 
 function extractTextFromComponent (component) {
   if (component == null) return ''
@@ -574,32 +605,37 @@ function extractTextFromComponent (component) {
   return text
 }
 
-function componentHasGreen (component) {
-  if (!component || typeof component !== 'object') return false
-  const color = typeof component.color === 'string' ? component.color.toLowerCase() : ''
-  if (color === 'green' || color === 'dark_green') return true
-  if (Array.isArray(component.extra)) {
-    return component.extra.some((part) => componentHasGreen(part))
+function collectComponentColors (component, colors = []) {
+  if (!component || typeof component !== 'object') return colors
+  if (typeof component.color === 'string' && component.color.trim() !== '') {
+    colors.push(component.color.trim().toLowerCase())
   }
-  return false
+  if (Array.isArray(component.extra)) {
+    for (const part of component.extra) {
+      collectComponentColors(part, colors)
+    }
+  }
+  return colors
 }
 
-function parseLoreLineInfo (rawLine) {
+function parseLoreColorInfo (rawLine) {
   const rawString = typeof rawLine === 'string' ? rawLine : String(rawLine)
-  let text = rawString
-  let selected = /§a|§2/i.test(rawString)
+  const legacyCodes = Array.from(rawString.matchAll(/§([0-9a-fk-or])/ig)).map((m) => m[1].toLowerCase())
+  let text = stripFormatting(rawString)
+  let jsonColors = []
 
   try {
     const parsed = JSON.parse(rawString)
-    text = extractTextFromComponent(parsed)
-    if (componentHasGreen(parsed)) selected = true
+    text = stripFormatting(extractTextFromComponent(parsed))
+    jsonColors = [...new Set(collectComponentColors(parsed))]
   } catch (err) {
-    // Not JSON.
+    // Not JSON lore; keep legacy color codes.
   }
 
   return {
-    text: stripFormatting(text),
-    selected
+    text,
+    legacyCodes,
+    jsonColors
   }
 }
 
@@ -618,17 +654,84 @@ function findSortControlSlot (window) {
   return null
 }
 
-function getSortSelection (window) {
-  const control = findSortControlSlot(window)
-  if (!control) return null
-  const loreLines = getLoreLines(control.item)
-  if (!loreLines || loreLines.length === 0) return null
-  const parsed = loreLines.map(parseLoreLineInfo)
-  for (const option of sortOptions) {
-    const match = parsed.find((line) => line.text.toLowerCase().includes(option.label.toLowerCase()))
-    if (match && match.selected) return option.key
+function isWhiteSortColor (value) {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (!normalized) return false
+  return normalized === 'white' || normalized === '#ffffff' || normalized === '#fff' || normalized === 'f'
+}
+
+function isLegacyColorCode (code) {
+  return /^[0-9a-f]$/i.test(String(code || ''))
+}
+
+function isSortLineSelectedByColor (lineInfo) {
+  if (!lineInfo) return false
+  if (Array.isArray(lineInfo.jsonColors) && lineInfo.jsonColors.length > 0) {
+    return lineInfo.jsonColors.some((color) => !isWhiteSortColor(color))
   }
-  return null
+  const legacyColors = (lineInfo.legacyCodes || []).filter(isLegacyColorCode)
+  if (legacyColors.length === 0) return false
+  const lastColorCode = legacyColors[legacyColors.length - 1].toLowerCase()
+  return lastColorCode !== 'f'
+}
+
+function getSortState (window) {
+  const control = findSortControlSlot(window)
+  if (!control) return { controlIndex: null, selectedKey: null, options: [] }
+  const loreLines = getLoreLines(control.item)
+  if (!loreLines || loreLines.length === 0) {
+    return {
+      controlIndex: control.index,
+      selectedKey: null,
+      options: sortOptions.map((option) => ({
+        key: option.key,
+        label: option.label,
+        selected: false,
+        lineIndex: -1,
+        text: option.label,
+        jsonColors: [],
+        legacyCodes: []
+      }))
+    }
+  }
+  const options = sortOptions.map((option) => ({
+    key: option.key,
+    label: option.label,
+    selected: false,
+    lineIndex: -1,
+    text: option.label,
+    jsonColors: [],
+    legacyCodes: []
+  }))
+  for (let i = 0; i < loreLines.length; i += 1) {
+    const lineInfo = parseLoreColorInfo(loreLines[i])
+    const lineText = lineInfo.text.toLowerCase()
+    for (const option of options) {
+      if (!lineText.includes(option.label.toLowerCase())) continue
+      option.lineIndex = i
+      option.text = lineInfo.text
+      option.jsonColors = lineInfo.jsonColors
+      option.legacyCodes = lineInfo.legacyCodes
+      option.selected = isSortLineSelectedByColor(lineInfo)
+      break
+    }
+  }
+  const selected = options.find((option) => option.selected)
+  return {
+    controlIndex: control.index,
+    selectedKey: selected ? selected.key : null,
+    options
+  }
+}
+
+function getConfiguredSortKey (scope) {
+  const fallback = scope === 'tracking'
+    ? defaultOrderConfig.trackingSort
+    : defaultOrderConfig.searchAllSort
+  const configured = scope === 'tracking'
+    ? ordersConfig.trackingSort
+    : ordersConfig.searchAllSort
+  return normalizeOrderSortKey(configured, fallback)
 }
 
 function clickWindowSlot (slotIndex) {
@@ -641,24 +744,67 @@ function clickWindowSlot (slotIndex) {
   }
 }
 
-async function ensureSortOption (window, desiredKey, maxAttempts = 5) {
-  const control = findSortControlSlot(window)
-  if (!control) return { ok: false, window }
+async function ensureSortOption (window, desiredKey, maxAttempts = 16) {
+  const normalizedDesired = normalizeOrderSortKey(desiredKey, defaultOrderConfig.searchAllSort)
+  if (!sortOptionByKey.has(normalizedDesired)) {
+    return { ok: false, window, reason: 'invalid-sort-key' }
+  }
   let currentWindow = window
-  let attempts = 0
-
-  while (attempts < maxAttempts) {
-    const selected = getSortSelection(currentWindow)
-    if (selected === desiredKey) {
-      return { ok: true, window: currentWindow }
-    }
-    clickWindowSlot(control.index)
-    await delay(600)
-    currentWindow = bot.currentWindow || currentWindow
-    attempts += 1
+  let state = getSortState(currentWindow)
+  if (!state || state.controlIndex == null) {
+    return { ok: false, window: currentWindow, reason: 'sort-control-missing' }
+  }
+  if (state.selectedKey === normalizedDesired) {
+    return { ok: true, window: currentWindow, selectedKey: state.selectedKey }
   }
 
-  return { ok: false, window: currentWindow }
+  let attempts = 0
+  const delayMin = Number.isFinite(searchAllPageDelayMinMs) ? searchAllPageDelayMinMs : defaultSortDelayMinMs
+  const delayMax = Number.isFinite(searchAllPageDelayMaxMs) ? searchAllPageDelayMaxMs : defaultSortDelayMaxMs
+
+  const clickAndCheck = async () => {
+    const controlIndex = state?.controlIndex
+    if (!Number.isInteger(controlIndex)) return false
+    if (!clickWindowSlot(controlIndex)) return false
+    await delay(randomBetween(delayMin, delayMax))
+    currentWindow = bot.currentWindow || currentWindow
+    state = getSortState(currentWindow)
+    attempts += 1
+    return true
+  }
+
+  if (state.selectedKey && sortOptionByKey.has(state.selectedKey)) {
+    const currentIndex = sortOptions.findIndex((option) => option.key === state.selectedKey)
+    const desiredIndex = sortOptions.findIndex((option) => option.key === normalizedDesired)
+    if (currentIndex >= 0 && desiredIndex >= 0) {
+      const plannedClicks = (desiredIndex - currentIndex + sortOptions.length) % sortOptions.length
+      for (let i = 0; i < plannedClicks && attempts < maxAttempts; i += 1) {
+        const ok = await clickAndCheck()
+        if (!ok) {
+          return { ok: false, window: currentWindow, reason: 'sort-click-failed' }
+        }
+        if (state?.selectedKey === normalizedDesired) {
+          return { ok: true, window: currentWindow, selectedKey: state.selectedKey }
+        }
+      }
+    }
+  }
+
+  while (attempts < maxAttempts) {
+    if (state?.selectedKey === normalizedDesired) {
+      return { ok: true, window: currentWindow, selectedKey: state.selectedKey }
+    }
+    const targetState = state?.options?.find((option) => option.key === normalizedDesired)
+    if (targetState?.selected) {
+      return { ok: true, window: currentWindow, selectedKey: normalizedDesired }
+    }
+    const ok = await clickAndCheck()
+    if (!ok) {
+      return { ok: false, window: currentWindow, reason: 'sort-click-failed' }
+    }
+  }
+
+  return { ok: false, window: currentWindow, reason: 'max-attempts' }
 }
 
 function slotMatchesProduct (slot, productKey) {
@@ -720,6 +866,7 @@ function clickNextArrow () {
 
 function waitForWindowChange (getWindow, previousSignature, timeoutMs = 6000) {
   const start = Date.now()
+  const hasTimeout = Number.isFinite(timeoutMs) && timeoutMs > 0
   return new Promise((resolve) => {
     const check = () => {
       const win = getWindow()
@@ -728,7 +875,7 @@ function waitForWindowChange (getWindow, previousSignature, timeoutMs = 6000) {
         resolve(true)
         return
       }
-      if (Date.now() - start >= timeoutMs) {
+      if (hasTimeout && Date.now() - start >= timeoutMs) {
         resolve(false)
         return
       }
@@ -742,6 +889,44 @@ function delay (ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+async function advanceSearchAllPageWithRecovery (currentWindow, page) {
+  let attempts = 0
+
+  while (searchAllRunning) {
+    attempts += 1
+    const signature = windowSignature(currentWindow)
+    console.log(`Search all clicking Next (page ${page}, attempt ${attempts})`)
+    if (!clickNextArrow()) {
+      return { ok: false, window: currentWindow, reason: 'click-failed' }
+    }
+
+    const pageDelay = randomBetween(searchAllPageDelayMinMs, searchAllPageDelayMaxMs)
+    await delay(pageDelay)
+    const changed = await waitForWindowChange(
+      () => bot.currentWindow || currentWindow,
+      signature,
+      searchAllStallTimeoutMs
+    )
+
+    if (changed) {
+      return { ok: true, window: bot.currentWindow || currentWindow, attempts }
+    }
+
+    const latestWindow = bot.currentWindow || currentWindow
+    currentWindow = latestWindow
+    const stillHasNext = hasNextArrow(currentWindow)
+    if (!stillHasNext) {
+      return { ok: false, window: currentWindow, reason: 'no-next-arrow', attempts }
+    }
+
+    console.warn(
+      `Search all stalled on page ${page} for ${searchAllStallTimeoutMs}ms; retrying Next click.`
+    )
+  }
+
+  return { ok: false, window: currentWindow, reason: 'search-stopped', attempts }
+}
+
 async function scanSearchAllPages (window) {
   if (!window) return
   searchAllScannerActive = true
@@ -749,17 +934,12 @@ async function scanSearchAllPages (window) {
   const runTs = searchAllRunTs
   let page = 1
   let currentWindow = window
-  let safety = 0
-  const seenSignatures = new Set()
 
-  const sortResult = await ensureSortOption(currentWindow, 'recently_listed')
+  const desiredSort = getConfiguredSortKey('searchAll')
+  const sortResult = await ensureSortOption(currentWindow, desiredSort)
   currentWindow = sortResult.window || currentWindow
 
-  while (currentWindow && searchAllRunning && safety < 200) {
-    if (searchAllStartedAt && Date.now() - searchAllStartedAt > searchAllTimeoutMs) {
-      console.warn('Search all exceeded timeout; stopping.')
-      break
-    }
+  while (currentWindow && searchAllRunning) {
     const snapshot = dumpWindowSlotsWithMeta(currentWindow, {
       page,
       productKey: '__all__',
@@ -773,14 +953,6 @@ async function scanSearchAllPages (window) {
       logSearchAllSnapshot(snapshot)
     }
     if (!snapshot) break
-    const signature = windowSignature(currentWindow)
-    if (signature) {
-      if (seenSignatures.has(signature)) {
-        console.warn('Search all detected repeated page signature; stopping to avoid loop.')
-        break
-      }
-      seenSignatures.add(signature)
-    }
     const slot53 = snapshot?.slots ? snapshot.slots[53] : null
     const next = hasNextArrowSlot(slot53, currentWindow?.slots ? currentWindow.slots[53] : null) || hasNextArrow(currentWindow)
     if (!next) {
@@ -791,18 +963,18 @@ async function scanSearchAllPages (window) {
       console.log(`Search all reached last page (no Next arrow). Slot53: ${name} "${label}"${lore ? ` | ${lore}` : ''}`)
       break
     }
-    console.log(`Search all clicking Next (page ${page})`)
-    if (!clickNextArrow()) break
-    const pageDelay = randomBetween(searchAllPageDelayMinMs, searchAllPageDelayMaxMs)
-    await delay(pageDelay)
-    const changed = await waitForWindowChange(() => bot.currentWindow || currentWindow, signature, 6000)
-    if (!changed) {
-      console.warn('Search all page did not change after clicking Next; stopping.')
+    const pageAdvance = await advanceSearchAllPageWithRecovery(currentWindow, page)
+    if (!pageAdvance.ok) {
+      currentWindow = pageAdvance.window || currentWindow
+      if (pageAdvance.reason !== 'no-next-arrow') {
+        console.warn(
+          `Search all stopped on page ${page} (${pageAdvance.reason || 'unknown'}).`
+        )
+      }
       break
     }
-    currentWindow = bot.currentWindow || currentWindow
+    currentWindow = pageAdvance.window || currentWindow
     page += 1
-    safety += 1
   }
 
   searchAllLastRunTs = runTs
@@ -813,7 +985,6 @@ function finishSearchAll (window) {
   searchAllRunning = false
   searchAllRunId = null
   searchAllRunTs = null
-  searchAllStartedAt = null
   searchAllScannerActive = false
   if (ordersOpenTimeout) {
     clearTimeout(ordersOpenTimeout)
@@ -924,6 +1095,24 @@ function startOrdersApiServer () {
       }
     }
 
+    if (url.pathname === '/track-once' && req.method === 'POST') {
+      try {
+        const payload = await readJsonBody(req)
+        const productKey = normalizeProductKey(payload.productKey || payload.product || '')
+        const commandName = payload.commandName || payload.ordersName || payload.command || payload.query || ''
+        if (!productKey) {
+          sendJson(res, 400, { ok: false, error: 'Missing productKey' })
+          return
+        }
+        const key = trackProductOnce(productKey, { commandName })
+        sendJson(res, 200, { ok: true, productKey: key })
+        return
+      } catch (err) {
+        sendJson(res, 400, { ok: false, error: 'Invalid JSON body' })
+        return
+      }
+    }
+
     if (url.pathname === '/untrack' && req.method === 'POST') {
       try {
         const payload = await readJsonBody(req)
@@ -1014,7 +1203,6 @@ function startOrdersApiServer () {
     if (url.pathname === '/search-all' && req.method === 'POST') {
       if (!searchAllRunning) {
         searchAllRequested = true
-        searchAllRequestedAt = Date.now()
         if (!currentTask && !ordersInFlight) {
           startSearchAll()
         }
@@ -1027,6 +1215,45 @@ function startOrdersApiServer () {
         lastRunTs: searchAllLastRunTs
       })
       return
+    }
+
+    if (url.pathname === '/order-config' && req.method === 'GET') {
+      sendJson(res, 200, {
+        ok: true,
+        searchAllSort: getConfiguredSortKey('searchAll'),
+        trackingSort: getConfiguredSortKey('tracking'),
+        options: sortOptions
+      })
+      return
+    }
+
+    if (url.pathname === '/order-config' && req.method === 'POST') {
+      try {
+        const payload = await readJsonBody(req)
+        const nextSearchAllSort = normalizeOrderSortKey(
+          payload.searchAllSort || payload.searchAll || payload?.sort?.searchAll,
+          getConfiguredSortKey('searchAll')
+        )
+        const nextTrackingSort = normalizeOrderSortKey(
+          payload.trackingSort || payload.tracking || payload?.sort?.tracking,
+          getConfiguredSortKey('tracking')
+        )
+        ordersConfig = {
+          searchAllSort: nextSearchAllSort,
+          trackingSort: nextTrackingSort
+        }
+        saveOrderConfig()
+        sendJson(res, 200, {
+          ok: true,
+          searchAllSort: ordersConfig.searchAllSort,
+          trackingSort: ordersConfig.trackingSort,
+          options: sortOptions
+        })
+        return
+      } catch (err) {
+        sendJson(res, 400, { ok: false, error: 'Invalid JSON body' })
+        return
+      }
     }
 
     if (url.pathname === '/alerts' && req.method === 'GET') {
@@ -1112,12 +1339,12 @@ bot.on('windowOpen', async (window) => {
     clearTimeout(ordersOpenTimeout)
     ordersOpenTimeout = null
   }
-  const productKey = currentTask?.productKey || ordersProductKey
+  const productKey = currentTask?.productKey || ''
   let activeWindow = window
-  let sortFallback = false
-  const sortResult = await ensureSortOption(window, 'most_money_per_item')
+  const trackingSort = getConfiguredSortKey('tracking')
+  const sortResult = await ensureSortOption(window, trackingSort)
   activeWindow = sortResult.window || activeWindow
-  sortFallback = !sortResult.ok
+  const sortFallback = !sortResult.ok && trackingSort === 'most_money_per_item'
   await captureOrdersSnapshotWithPagination(activeWindow, {
     page: 1,
     productKey,
@@ -1412,7 +1639,7 @@ function parseLore (name, lore) {
 function buildOrdersSnapshot (slots, meta) {
   const nowIso = new Date().toISOString()
   const page = meta && meta.page ? meta.page : 1
-  const productKey = meta?.productKey || currentTask?.productKey || ordersProductKey
+  const productKey = meta?.productKey || currentTask?.productKey || ''
 
   const namedSlot = slots.find((s) => s.order?.name) || slots.find((s) => s.item?.displayName)
   const productName = meta?.productName || namedSlot?.order?.name || namedSlot?.item?.displayName || productKey
