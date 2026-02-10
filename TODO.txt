@@ -1,0 +1,12 @@
+1. Fix item search so it finds the item after page 1 and to a minimum of 5 orders. (keep aliases for now).
+2. Treat enchanted items as unique products in Margins, and calculate crafting costs by tracking enchanted 
+    book costs once in Orders or by using the maximum cost found in Search All. Add books to recipe. 
+    Add unique button to enchantable items to track once or constantly the books. Add a dropdown to Product
+    Page, first result will be highest price for UNENCHANTED ITEM searched, then, in the "Materials" add a 
+    dropdown to switch to a list the 3 highest prices for UNENCHANTED ITEM and then ALL the enchanted items,
+    with a extendable container of results that moves  Alerts down and extends Max price overtime to not ruin
+    the ui. Make SearchAll results show up in Products page too for Enchantments after Tracking results.
+3. Fix the headers in Margins.
+4. Add a Favorite Items page and toggle.
+5. Fix Grouped view after enchanted items change.
+6. Fix Margins results list of products.

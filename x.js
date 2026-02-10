@@ -1658,7 +1658,8 @@ function buildOrdersSnapshot (slots, meta) {
         amountDelivered: maxSlot.order.amountDelivered,
         slot: maxSlot.slot,
         userName: maxSlot.order.userName,
-        expiresAt: maxSlot.order.expiresAt ?? null
+        expiresAt: maxSlot.order.expiresAt ?? null,
+        enchantments: Array.isArray(maxSlot.order.enchantments) ? maxSlot.order.enchantments : []
       }
     : null
 

@@ -1094,14 +1094,116 @@ canvas {
 .craft-panel {
   display: flex;
   flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px 12px;
+  overflow: visible;
+}
+
+.variant-picker {
+  position: relative;
+  z-index: 6;
+}
+
+.variant-picker-button {
+  width: 100%;
+  border: 1px solid #d4c7b8;
+  background: #fff8ee;
+  color: #2b2b2b;
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   gap: 8px;
-  padding: 14px 16px 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.variant-picker-button::after {
+  content: '▾';
+  color: #6b6f76;
+  font-size: 12px;
+}
+
+.variant-picker.open .variant-picker-button::after {
+  content: '▴';
+}
+
+.variant-picker-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  border: 1px solid #d9cbb8;
+  background: #fff9f1;
+  border-radius: 10px;
+  box-shadow: 0 10px 24px rgba(31, 41, 51, 0.18);
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.variant-picker-menu::-webkit-scrollbar {
+  width: 8px;
+}
+
+.variant-picker-menu::-webkit-scrollbar-thumb {
+  background: rgba(107, 111, 118, 0.45);
+  border-radius: 8px;
+}
+
+.variant-option {
+  border: 1px solid #e1d8cb;
+  background: #fffefc;
+  color: #2b2b2b;
+  border-radius: 8px;
+  padding: 6px 8px;
+  font-size: 10px;
+  text-align: left;
+  cursor: pointer;
+  width: 100%;
+}
+
+.variant-option:hover {
+  border-color: rgba(240, 93, 59, 0.45);
+}
+
+.variant-option.active {
+  border-color: #f05d3b;
+  box-shadow: 0 0 0 1px rgba(240, 93, 59, 0.2) inset;
+}
+
+.variant-option-main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-weight: 600;
+}
+
+.variant-option-meta {
+  margin-top: 2px;
+  color: #4b4f56;
+}
+
+.variant-empty {
+  padding: 6px 8px;
+  font-size: 11px;
+  color: #6b6f76;
 }
 
 .craft-summary {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
+  gap: 6px;
   font-size: 10px;
   color: var(--muted);
 }
@@ -1110,7 +1212,7 @@ canvas {
   background: #f5efe6;
   border: 1px solid #e1d8cb;
   border-radius: 10px;
-  padding: 5px 8px;
+  padding: 4px 7px;
   min-width: 0;
 }
 
@@ -1132,10 +1234,10 @@ canvas {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 6px;
+  gap: 5px;
   overflow-y: auto;
   padding-right: 4px;
-  max-height: 170px;
+  max-height: 210px;
   scrollbar-width: thin;
   scrollbar-color: rgba(107, 111, 118, 0.45) transparent;
 }
@@ -1156,11 +1258,11 @@ canvas {
 .craft-item {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   background: #f5efe6;
   border: 1px solid #e1d8cb;
   border-radius: 12px;
-  padding: 6px 8px;
+  padding: 5px 7px;
   align-items: center;
   width: fit-content;
   max-width: 100%;
@@ -1187,14 +1289,14 @@ canvas {
 
 .craft-item .item-name {
   font-weight: 600;
-  font-size: 11px;
+  font-size: 10px;
 }
 
 .craft-item .item-actions {
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin-top: 2px;
+  gap: 8px;
+  margin-top: 1px;
 }
 
 .craft-item .craft-alias {
@@ -1208,7 +1310,7 @@ canvas {
 .craft-item .item-actions button {
   border: 1px solid #d4c7b8;
   background: #fff8ee;
-  padding: 3px 6px;
+  padding: 2px 6px;
   border-radius: 8px;
   font-size: 10px;
   cursor: pointer;
@@ -1220,19 +1322,34 @@ canvas {
   color: #0f2b22;
 }
 
+.craft-book-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.craft-book-actions button {
+  border: 1px solid #d4c7b8;
+  background: #fff8ee;
+  padding: 2px 6px;
+  border-radius: 8px;
+  font-size: 10px;
+  cursor: pointer;
+}
+
 .craft-item .metrics {
-  margin-left: 20px;
+  margin-left: 12px;
   text-align: right;
-  font-size: 11px;
+  font-size: 10px;
   color: #4b4f56;
-  min-width: 100px;
+  min-width: 90px;
   flex: 0 0 auto;
 }
 
 .craft-item .metrics strong {
   display: block;
   color: var(--ink);
-  font-size: 12px;
+  font-size: 11px;
 }
 
 .slot.empty {

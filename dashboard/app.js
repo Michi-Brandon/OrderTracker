@@ -19,6 +19,9 @@ const trackingSortSelect = document.getElementById('trackingSortSelect')
 const orderConfigStatus = document.getElementById('orderConfigStatus')
 const craftSummary = document.getElementById('craftSummary')
 const craftList = document.getElementById('craftList')
+const variantPicker = document.getElementById('variantPicker')
+const variantPickerButton = document.getElementById('variantPickerButton')
+const variantPickerMenu = document.getElementById('variantPickerMenu')
 const trackAliasInput = document.getElementById('trackAliasInput')
 const chatMessageInput = document.getElementById('chatMessageInput')
 const chatSendButton = document.getElementById('chatSendButton')
@@ -74,6 +77,12 @@ let groupedRuns = []
 let latestGroupedRun = null
 let groupedOrdersByItem = new Map()
 let groupedItemCounts = new Map()
+let groupedOrdersByVariant = new Map()
+let groupedVariantsByBase = new Map()
+let groupedVariantMetaByBase = new Map()
+let trackedOrdersByVariant = new Map()
+let trackedVariantsByBase = new Map()
+let selectedVariantOptions = []
 let loadingAllPages = false
 let marginsHours = 24
 let marginRowsCache = []
@@ -325,6 +334,117 @@ function getItemKey (item) {
   return normalizeItemKey(item.name || item.displayName || '')
 }
 
+const romanLevelsMap = {
+  1: 'I',
+  2: 'II',
+  3: 'III',
+  4: 'IV',
+  5: 'V',
+  6: 'VI',
+  7: 'VII',
+  8: 'VIII',
+  9: 'IX',
+  10: 'X'
+}
+
+function toRomanLevel (level) {
+  const normalized = Number(level)
+  if (!Number.isFinite(normalized) || normalized <= 0) return 'I'
+  return romanLevelsMap[normalized] || `${Math.round(normalized)}`
+}
+
+function formatEnchantName (name) {
+  const cleaned = String(name || '')
+    .trim()
+    .replace(/^minecraft:/, '')
+    .replace(/[_\-]+/g, ' ')
+  if (!cleaned) return 'Unknown'
+  return cleaned
+    .split(' ')
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ')
+}
+
+function normalizeEnchantments (enchantments) {
+  if (!Array.isArray(enchantments)) return []
+  const list = enchantments
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object') return null
+      const name = normalizeItemKey(entry.name || entry.id || '')
+      if (!name) return null
+      const levelRaw = Number(entry.level)
+      const level = Number.isFinite(levelRaw) && levelRaw > 0 ? Math.floor(levelRaw) : 1
+      return { name, level }
+    })
+    .filter(Boolean)
+  list.sort((a, b) => {
+    const nameDiff = a.name.localeCompare(b.name)
+    if (nameDiff !== 0) return nameDiff
+    return a.level - b.level
+  })
+  return list
+}
+
+function buildEnchantSignature (enchantments) {
+  const normalized = normalizeEnchantments(enchantments)
+  if (normalized.length === 0) return ''
+  return normalized.map((entry) => `${entry.name}:${entry.level}`).join('|')
+}
+
+function buildVariantKey (baseKey, signature = '') {
+  const itemKey = normalizeItemKey(baseKey)
+  if (!itemKey) return ''
+  const enchSig = String(signature || '').trim()
+  return enchSig ? `${itemKey}::${enchSig}` : `${itemKey}::plain`
+}
+
+function getVariantSignatureFromOrder (order) {
+  if (!order || typeof order !== 'object') return ''
+  return buildEnchantSignature(order.enchantments || [])
+}
+
+function getVariantEnchantmentsFromOrder (order) {
+  if (!order || typeof order !== 'object') return []
+  return normalizeEnchantments(order.enchantments || [])
+}
+
+function formatEnchantmentsCompact (enchantments, maxVisible = 2) {
+  const list = normalizeEnchantments(enchantments)
+  if (list.length === 0) return 'Unenchanted'
+  const entries = list.map((entry) => `${formatEnchantName(entry.name)} ${toRomanLevel(entry.level)}`)
+  if (entries.length <= maxVisible) return entries.join(', ')
+  const shown = entries.slice(0, maxVisible).join(', ')
+  return `${shown}, +${entries.length - maxVisible}`
+}
+
+function formatVariantDisplayName (baseName, enchantments) {
+  const cleanBase = baseName || 'Unknown'
+  const summary = formatEnchantmentsCompact(enchantments, 2)
+  return summary === 'Unenchanted' ? `${cleanBase} (Unenchanted)` : `${cleanBase} (${summary})`
+}
+
+function getSlotVariantInfo (slot) {
+  if (!slot?.item || !slot?.order) return null
+  const baseKey = normalizeItemKey(slot.item.name || '')
+  if (!baseKey) return null
+  const enchantments = getVariantEnchantmentsFromOrder(slot.order)
+  const signature = buildEnchantSignature(enchantments)
+  return {
+    baseKey,
+    signature,
+    enchantments,
+    variantKey: buildVariantKey(baseKey, signature),
+    isEnchanted: enchantments.length > 0
+  }
+}
+
+function slotMatchesVariant (slot, signature) {
+  const target = String(signature || '')
+  if (!slot?.order) return target === ''
+  return getVariantSignatureFromOrder(slot.order) === target
+}
+
 function itemIconUrl (item) {
   const key = getItemKey(item)
   if (!key) return '/item-placeholder.svg'
@@ -352,7 +472,10 @@ function slotMatchesKey (slot, key) {
 }
 
 function slotMatchesSelected (slot) {
-  return slotMatchesKey(slot, selectedProduct?.key)
+  if (!slotMatchesKey(slot, selectedProduct?.key)) return false
+  const signature = selectedProduct?.variantSignature
+  if (signature == null) return true
+  return slotMatchesVariant(slot, signature)
 }
 
 function collectItems (snapshot, maxSlots) {
@@ -418,10 +541,66 @@ function pickBestOrder (orders) {
   return best
 }
 
+function addVariantRecord (targetMap, baseKey, signature, record) {
+  const normalizedKey = normalizeItemKey(baseKey)
+  if (!normalizedKey) return
+  const sig = String(signature || '')
+  const byBase = targetMap.get(normalizedKey) || new Map()
+  const list = byBase.get(sig) || []
+  list.push(record)
+  byBase.set(sig, list)
+  targetMap.set(normalizedKey, byBase)
+}
+
+function buildTrackedIndexes () {
+  const byVariant = new Map()
+  const byBase = new Map()
+  for (const snapshot of snapshots || []) {
+    if (!snapshot?.slots || !Array.isArray(snapshot.slots)) continue
+    for (const slot of snapshot.slots) {
+      if (!slot?.order || !slot?.item) continue
+      const variantInfo = getSlotVariantInfo(slot)
+      if (!variantInfo) continue
+      const priceRaw = Number(slot.order.price)
+      const price = Number.isFinite(priceRaw) ? priceRaw : null
+      if (price == null) continue
+      const amountOrderedRaw = Number(slot.order.amountOrdered)
+      const amountDeliveredRaw = Number(slot.order.amountDelivered)
+      const amountOrdered = Number.isFinite(amountOrderedRaw) ? amountOrderedRaw : 0
+      const amountDelivered = Number.isFinite(amountDeliveredRaw) ? amountDeliveredRaw : 0
+      const record = {
+        key: variantInfo.baseKey,
+        signature: variantInfo.signature,
+        variantKey: variantInfo.variantKey,
+        enchantments: variantInfo.enchantments,
+        name: slot.item.displayName || slot.item.name || variantInfo.baseKey,
+        ts: snapshot.ts,
+        source: 'tracked',
+        page: Number(snapshot.page) || 1,
+        slot: Number.isFinite(Number(slot.slot)) ? Number(slot.slot) : null,
+        userName: slot.order.userName || '—',
+        price,
+        amountOrdered,
+        amountDelivered,
+        totalOrdered: price * amountOrdered,
+        totalDelivered: price * amountDelivered
+      }
+      const variantBucket = byVariant.get(variantInfo.variantKey) || []
+      variantBucket.push(record)
+      byVariant.set(variantInfo.variantKey, variantBucket)
+      addVariantRecord(byBase, variantInfo.baseKey, variantInfo.signature, record)
+    }
+  }
+  trackedOrdersByVariant = byVariant
+  trackedVariantsByBase = byBase
+}
+
 function buildGroupedRuns () {
   const runsMap = new Map()
   const ordersByItem = new Map()
+  const ordersByVariant = new Map()
   const countsByItem = new Map()
+  const variantsByBaseMeta = new Map()
   for (const page of allPages || []) {
     if (!page || !page.ts) continue
     const runId = page.runId || page.runTs || page.ts
@@ -441,8 +620,11 @@ function buildGroupedRuns () {
     const slots = page.slots || []
     for (const slot of slots) {
       if (!slot?.order || !slot?.item) continue
-      const key = normalizeItemKey(slot.item.name || getItemKey(slot.item))
-      if (!key) continue
+      const variantInfo = getSlotVariantInfo(slot)
+      if (!variantInfo) continue
+      const key = variantInfo.baseKey
+      const signature = variantInfo.signature
+      const variantKey = variantInfo.variantKey
       const pageTs = page.ts || runTs || null
       const amountOrderedRaw = Number(slot.order.amountOrdered)
       const amountDeliveredRaw = Number(slot.order.amountDelivered)
@@ -450,8 +632,11 @@ function buildGroupedRuns () {
       const amountDelivered = Number.isFinite(amountDeliveredRaw) ? amountDeliveredRaw : 0
       const priceRaw = Number(slot.order.price)
       const price = Number.isFinite(priceRaw) ? priceRaw : null
-      const entry = run.items.get(key) || {
+      const entry = run.items.get(variantKey) || {
         key,
+        signature,
+        variantKey,
+        enchantments: variantInfo.enchantments,
         name: slot.item.displayName || slot.item.name || key,
         orders: []
       }
@@ -461,12 +646,15 @@ function buildGroupedRuns () {
         amountDelivered,
         userName: slot.order.userName
       })
-      run.items.set(key, entry)
+      run.items.set(variantKey, entry)
 
       if (price != null) {
         const bucket = ordersByItem.get(key) || []
         bucket.push({
           key,
+          signature,
+          variantKey,
+          enchantments: variantInfo.enchantments,
           name: slot.item.displayName || slot.item.name || key,
           ts: pageTs,
           runId,
@@ -480,7 +668,38 @@ function buildGroupedRuns () {
           totalDelivered: price * amountDelivered
         })
         ordersByItem.set(key, bucket)
+        const variantBucket = ordersByVariant.get(variantKey) || []
+        variantBucket.push({
+          key,
+          signature,
+          variantKey,
+          enchantments: variantInfo.enchantments,
+          name: slot.item.displayName || slot.item.name || key,
+          ts: pageTs,
+          runId,
+          page: Number(page.page) || 1,
+          slot: Number.isFinite(Number(slot.slot)) ? Number(slot.slot) : null,
+          userName: slot.order.userName || '—',
+          price,
+          amountOrdered,
+          amountDelivered,
+          totalOrdered: price * amountOrdered,
+          totalDelivered: price * amountDelivered
+        })
+        ordersByVariant.set(variantKey, variantBucket)
         countsByItem.set(key, (countsByItem.get(key) || 0) + 1)
+
+        const byBaseMeta = variantsByBaseMeta.get(key) || new Map()
+        if (!byBaseMeta.has(signature)) {
+          byBaseMeta.set(signature, {
+            key,
+            signature,
+            variantKey,
+            enchantments: variantInfo.enchantments,
+            name: slot.item.displayName || slot.item.name || key
+          })
+        }
+        variantsByBaseMeta.set(key, byBaseMeta)
       }
     }
 
@@ -503,15 +722,41 @@ function buildGroupedRuns () {
   groupedRuns = runs
   latestGroupedRun = runs.length > 0 ? runs[runs.length - 1] : null
   groupedOrdersByItem = ordersByItem
+  groupedOrdersByVariant = ordersByVariant
   groupedItemCounts = countsByItem
+
+  const variantsByBase = new Map()
+  const variantsMetaByBase = new Map()
+  for (const [baseKey, signaturesMap] of variantsByBaseMeta.entries()) {
+    const variants = Array.from(signaturesMap.values())
+    variants.sort((a, b) => {
+      const aCount = (ordersByVariant.get(a.variantKey) || []).length
+      const bCount = (ordersByVariant.get(b.variantKey) || []).length
+      if (bCount !== aCount) return bCount - aCount
+      const aPrice = (ordersByVariant.get(a.variantKey) || [])[0]?.price ?? 0
+      const bPrice = (ordersByVariant.get(b.variantKey) || [])[0]?.price ?? 0
+      if (bPrice !== aPrice) return bPrice - aPrice
+      return a.name.localeCompare(b.name)
+    })
+    const recordsBySignature = new Map()
+    for (const variant of variants) {
+      recordsBySignature.set(variant.signature || '', ordersByVariant.get(variant.variantKey) || [])
+    }
+    variantsByBase.set(baseKey, recordsBySignature)
+    variantsMetaByBase.set(baseKey, variants)
+  }
+  groupedVariantsByBase = variantsByBase
+  groupedVariantMetaByBase = variantsMetaByBase
 }
 
 function getGroupedSeries () {
   if (!selectedProduct?.key) return []
-  const key = selectedProduct.key
+  const key = normalizeItemKey(selectedProduct.key)
+  const signature = String(selectedProduct?.variantSignature || '')
+  const variantKey = buildVariantKey(key, signature)
   const series = []
   for (const run of groupedRuns || []) {
-    const entry = run.items.get(key)
+    const entry = run.items.get(variantKey)
     if (!entry || !entry.best) continue
     series.push({
       ts: run.ts,
@@ -524,7 +769,8 @@ function getGroupedSeries () {
         amountOrdered: entry.best.amountOrdered,
         amountDelivered: entry.best.amountDelivered,
         remaining: entry.best.remaining,
-        userName: entry.best.userName
+        userName: entry.best.userName,
+        enchantments: entry.enchantments || []
       }
     })
   }
@@ -540,14 +786,309 @@ function getFilteredGroupedSeries () {
   return series
 }
 
-function setSelectedProduct (item) {
+function getBaseDisplayName (baseKey) {
+  const normalized = normalizeItemKey(baseKey)
+  if (!normalized) return baseKey || '—'
+  const fromCatalog = itemsCatalog.find((item) => item.name === normalized)
+  if (fromCatalog?.displayName) return fromCatalog.displayName
+  const groupedVariantMap = groupedVariantsByBase.get(normalized)
+  if (groupedVariantMap && groupedVariantMap.size > 0) {
+    const firstRecords = groupedVariantMap.values().next().value
+    if (Array.isArray(firstRecords) && firstRecords[0]?.name) return firstRecords[0].name
+  }
+  const trackedVariantMap = trackedVariantsByBase.get(normalized)
+  if (trackedVariantMap && trackedVariantMap.size > 0) {
+    const firstList = trackedVariantMap.values().next().value
+    if (Array.isArray(firstList) && firstList[0]?.name) return firstList[0].name
+  }
+  return normalized
+}
+
+function summarizeVariantRecords (records, sinceMs = null) {
+  if (!Array.isArray(records) || records.length === 0) return null
+  const cutoff = Number.isFinite(sinceMs) && sinceMs > 0 ? Date.now() - sinceMs : null
+  const filtered = records
+    .filter((record) => {
+      const price = Number(record?.price)
+      if (!Number.isFinite(price)) return false
+      if (cutoff == null) return true
+      const tsMs = record?.ts ? new Date(record.ts).getTime() : 0
+      return !(tsMs && tsMs < cutoff)
+    })
+    .sort((a, b) => {
+      if (b.price !== a.price) return b.price - a.price
+      const aTs = a.ts ? new Date(a.ts).getTime() : 0
+      const bTs = b.ts ? new Date(b.ts).getTime() : 0
+      return bTs - aTs
+    })
+  if (filtered.length === 0) return null
+
+  let min = Infinity
+  let max = -Infinity
+  let sum = 0
+  let latestTs = 0
+  let latestPrice = null
+
+  for (const record of filtered) {
+    const price = Number(record.price)
+    if (!Number.isFinite(price)) continue
+    sum += price
+    if (price < min) min = price
+    if (price > max) max = price
+    const tsMs = record.ts ? new Date(record.ts).getTime() : 0
+    if (tsMs >= latestTs) {
+      latestTs = tsMs
+      latestPrice = price
+    }
+  }
+
+  const first = filtered[0]
+  return {
+    min,
+    max,
+    latest: latestPrice,
+    count: filtered.length,
+    avg: sum / Math.max(filtered.length, 1),
+    topRecord: first,
+    records: filtered,
+    signature: first?.signature || '',
+    enchantments: normalizeEnchantments(first?.enchantments || []),
+    name: first?.name || ''
+  }
+}
+
+function getVariantSummariesForProduct (productKey) {
+  const baseKey = normalizeItemKey(productKey)
+  if (!baseKey) return []
+  const trackedMap = trackedVariantsByBase.get(baseKey) || new Map()
+  const groupedMap = groupedVariantsByBase.get(baseKey) || new Map()
+  const signatures = new Set([...trackedMap.keys(), ...groupedMap.keys()])
+
+  const results = []
+  for (const signature of signatures) {
+    const trackedRecords = trackedMap.get(signature) || []
+    const groupedRecords = groupedMap.get(signature) || []
+    const trackedSummary = summarizeVariantRecords(trackedRecords)
+    const groupedSummary = summarizeVariantRecords(groupedRecords)
+    const preferred = trackedSummary || groupedSummary
+    if (!preferred) continue
+    results.push({
+      baseKey,
+      signature,
+      variantKey: buildVariantKey(baseKey, signature),
+      enchantments: preferred.enchantments,
+      name: preferred.name || getBaseDisplayName(baseKey),
+      source: trackedSummary ? 'tracked' : 'grouped',
+      summary: preferred,
+      trackedSummary,
+      groupedSummary
+    })
+  }
+
+  results.sort((a, b) => {
+    const aIsPlain = a.signature === ''
+    const bIsPlain = b.signature === ''
+    if (aIsPlain !== bIsPlain) return aIsPlain ? -1 : 1
+    if (b.summary.max !== a.summary.max) return b.summary.max - a.summary.max
+    return (b.summary.count || 0) - (a.summary.count || 0)
+  })
+  return results
+}
+
+function buildVariantDropdownOptions (productKey) {
+  const baseKey = normalizeItemKey(productKey)
+  if (!baseKey) return []
+  const baseName = getBaseDisplayName(baseKey)
+  const summaries = getVariantSummariesForProduct(baseKey)
+  if (summaries.length === 0) return []
+
+  const options = []
+  const plainSummary = summaries.find((entry) => entry.signature === '')
+  if (plainSummary) {
+    const records = plainSummary.summary.records || []
+    const topPlainOffers = records.slice(0, 4)
+    topPlainOffers.forEach((record, index) => {
+      const sourceTag = plainSummary.source === 'tracked' ? 'TRK' : 'ALL'
+      const rankLabel = index === 0 ? 'Top unenchanted' : `Alt unenchanted #${index + 1}`
+      options.push({
+        id: `plain:${index}`,
+        type: index === 0 ? 'plain-primary' : 'plain-offer',
+        baseKey,
+        signature: '',
+        variantKey: plainSummary.variantKey,
+        enchantments: [],
+        source: plainSummary.source,
+        price: record.price,
+        userName: record.userName || '—',
+        ts: record.ts || null,
+        hint: {
+          price: record.price,
+          userName: record.userName || ''
+        },
+        buttonLabel: `${rankLabel} • ${formatPrice(Math.round(record.price))} [${sourceTag}]`,
+        menuMain: `${rankLabel} • ${formatPrice(Math.round(record.price))}`,
+        menuMeta: `${baseName} • ${sourceTag} • ${record.userName || '—'}`
+      })
+    })
+  }
+
+  const enchanted = summaries
+    .filter((entry) => entry.signature !== '')
+    .sort((a, b) => b.summary.max - a.summary.max)
+
+  for (const entry of enchanted) {
+    const sourceTag = entry.source === 'tracked' ? 'TRK' : 'ALL'
+    options.push({
+      id: `ench:${entry.signature}`,
+      type: 'enchanted-variant',
+      baseKey,
+      signature: entry.signature,
+      variantKey: entry.variantKey,
+      enchantments: entry.enchantments,
+      source: entry.source,
+      price: entry.summary.max,
+      userName: entry.summary.topRecord?.userName || '—',
+      ts: entry.summary.topRecord?.ts || null,
+      hint: {
+        price: entry.summary.topRecord?.price,
+        userName: entry.summary.topRecord?.userName || ''
+      },
+      buttonLabel: `${formatEnchantmentsCompact(entry.enchantments, 2)} • ${formatPrice(Math.round(entry.summary.max))} [${sourceTag}]`,
+      menuMain: `${formatEnchantmentsCompact(entry.enchantments, 3)} • ${formatPrice(Math.round(entry.summary.max))}`,
+      menuMeta: `${baseName} • ${sourceTag} • ${entry.summary.topRecord?.userName || '—'}`
+    })
+  }
+
+  return options
+}
+
+function selectVariantOption (option, rerender = true) {
+  if (!selectedProduct || !option) return
+  selectedProduct.variantSignature = option.signature || ''
+  selectedProduct.variantEnchantments = normalizeEnchantments(option.enchantments || [])
+  selectedProduct.variantOptionId = option.id
+  selectedProduct.variantHint = option.hint || null
+  renderVariantPicker()
+  if (!rerender) return
+  activeSnapshot = null
+  activeSnapshotLocked = false
+  renderChart()
+  renderActiveSnapshot()
+  renderGroupedSummary()
+  renderMargins()
+}
+
+function refreshVariantOptions (selection = {}) {
+  if (!selectedProduct?.key) {
+    selectedVariantOptions = []
+    renderVariantPicker()
+    return
+  }
+  selectedVariantOptions = buildVariantDropdownOptions(selectedProduct.key)
+  if (selectedVariantOptions.length === 0) {
+    selectedProduct.variantSignature = ''
+    selectedProduct.variantEnchantments = []
+    selectedProduct.variantOptionId = ''
+    selectedProduct.variantHint = null
+    renderVariantPicker()
+    return
+  }
+
+  const preserveId = selection.preserve && selectedProduct.variantOptionId
+    ? selectedProduct.variantOptionId
+    : ''
+  const preferredId = selection.optionId || ''
+  const preferredSignature = typeof selection.signature === 'string' ? selection.signature : null
+  const hintPrice = parseNumberOrNull(selection.hint?.price)
+  const hintUser = String(selection.hint?.userName || '').trim().toLowerCase()
+
+  let option = null
+  if (preferredId) {
+    option = selectedVariantOptions.find((entry) => entry.id === preferredId) || null
+  }
+  if (!option && preserveId) {
+    option = selectedVariantOptions.find((entry) => entry.id === preserveId) || null
+  }
+  if (!option && preferredSignature != null) {
+    option = selectedVariantOptions.find((entry) => entry.signature === preferredSignature) || null
+  }
+  if (!option && hintPrice != null) {
+    option = selectedVariantOptions.find((entry) => {
+      const price = Number(entry.hint?.price)
+      if (!Number.isFinite(price)) return false
+      if (Math.abs(price - hintPrice) > 1e-9) return false
+      if (!hintUser) return true
+      return String(entry.hint?.userName || '').trim().toLowerCase() === hintUser
+    }) || null
+  }
+  if (!option) option = selectedVariantOptions[0]
+  selectVariantOption(option, false)
+}
+
+function renderVariantPicker () {
+  if (!variantPicker || !variantPickerButton || !variantPickerMenu) return
+  if (!selectedProduct?.key || selectedVariantOptions.length === 0) {
+    variantPicker.hidden = true
+    variantPicker.classList.remove('open')
+    variantPickerMenu.hidden = true
+    variantPickerMenu.innerHTML = ''
+    return
+  }
+
+  variantPicker.hidden = false
+  const activeOption = selectedVariantOptions.find((entry) => entry.id === selectedProduct.variantOptionId) || selectedVariantOptions[0]
+  variantPickerButton.textContent = activeOption ? activeOption.buttonLabel : 'Select variant'
+  variantPickerMenu.innerHTML = ''
+
+  if (selectedVariantOptions.length === 0) {
+    variantPickerMenu.innerHTML = '<div class="variant-empty">No variants found.</div>'
+    return
+  }
+
+  for (const option of selectedVariantOptions) {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'variant-option'
+    if (selectedProduct.variantOptionId === option.id) {
+      button.classList.add('active')
+    }
+    button.innerHTML = `
+      <div class="variant-option-main">${option.menuMain}</div>
+      <div class="variant-option-meta">${option.menuMeta}</div>
+    `
+    button.addEventListener('click', (event) => {
+      event.stopPropagation()
+      variantPicker.classList.remove('open')
+      variantPickerMenu.hidden = true
+      selectVariantOption(option, true)
+    })
+    variantPickerMenu.appendChild(button)
+  }
+  if (!variantPicker.classList.contains('open')) {
+    variantPickerMenu.hidden = true
+  }
+}
+
+function setSelectedProduct (item, selection = {}) {
   if (!item) return
+  const normalized = normalizeItemKey(item.name || item.key || '')
+  if (!normalized) return
   selectedProduct = {
-    key: item.name,
-    name: item.displayName || item.name
+    key: normalized,
+    name: item.displayName || item.name || normalized,
+    variantSignature: '',
+    variantEnchantments: [],
+    variantOptionId: '',
+    variantHint: null
   }
   activeSnapshot = null
   activeSnapshotLocked = false
+  refreshVariantOptions({
+    preserve: false,
+    optionId: selection.optionId || '',
+    signature: selection.signature,
+    hint: selection.hint || null
+  })
   updateProductLabels()
   updateTrackButton()
   renderTrackedList()
@@ -577,7 +1118,7 @@ function updateProductLabels (snapshot = null, options = {}) {
   }
 
   selectedProductLabel.textContent = selectedProduct
-    ? `Selected: ${selectedProduct.name}`
+    ? `Selected: ${selectedProduct.name} • ${formatEnchantmentsCompact(selectedProduct.variantEnchantments || [], 2)}`
     : 'Selected: —'
 
   trackButton.disabled = !selectedProduct
@@ -847,7 +1388,7 @@ function getMarginRankMap (rows) {
   const map = new Map()
   const list = Array.isArray(rows) ? rows : []
   for (let i = 0; i < list.length; i += 1) {
-    const key = normalizeItemKey(list[i]?.key)
+    const key = String(list[i]?.id || list[i]?.key || '').trim()
     if (!key || map.has(key)) continue
     map.set(key, i + 1)
   }
@@ -858,10 +1399,10 @@ function showMarginMoveNotice (itemKey, fromRank, toRank, targetKey = '') {
   if (!itemKey || !Number.isFinite(fromRank) || !Number.isFinite(toRank)) return
   if (toRank <= fromRank) return
   marginMoveNotice = {
-    key: normalizeItemKey(itemKey),
+    key: String(itemKey || '').trim(),
     from: fromRank,
     to: toRank,
-    targetKey: normalizeItemKey(targetKey),
+    targetKey: String(targetKey || '').trim(),
     expiresAt: Date.now() + 6000
   }
   setTimeout(() => {
@@ -942,11 +1483,13 @@ async function trackProductsBatch (productKeys, options = {}) {
     ...uniqueKeys,
     ...((options.highlightKeys || []).map((key) => normalizeItemKey(key)).filter(Boolean))
   ]
+  const highlightRowIds = [...new Set((options.highlightRowIds || []).map((id) => String(id || '').trim()).filter(Boolean))]
+  const highlightTokens = [...new Set([...highlightKeys, ...highlightRowIds])]
   const rankBefore = getMarginRankMap(marginRowsCache)
   if (options.once) {
     addTransientTrackEntries(uniqueKeys)
   }
-  highlightKeys.forEach((key) => marginTrackingPendingKeys.add(key))
+  highlightTokens.forEach((key) => marginTrackingPendingKeys.add(key))
   if (activeTab === 'margins') {
     await renderMargins()
   }
@@ -964,16 +1507,16 @@ async function trackProductsBatch (productKeys, options = {}) {
     await loadSnapshots()
     await loadAllPages()
   } finally {
-    highlightKeys.forEach((key) => marginTrackingPendingKeys.delete(key))
+    highlightTokens.forEach((key) => marginTrackingPendingKeys.delete(key))
     await renderMargins()
-    const anchorKey = normalizeItemKey(options.anchorKey)
+    const anchorKey = String(options.anchorKey || '').trim()
     if (anchorKey) {
       const rankAfter = getMarginRankMap(marginRowsCache)
       const fromRank = rankBefore.get(anchorKey)
       const toRank = rankAfter.get(anchorKey)
       if (Number.isFinite(fromRank) && Number.isFinite(toRank) && toRank > fromRank) {
         const targetRow = marginRowsCache[toRank - 1]
-        showMarginMoveNotice(anchorKey, fromRank, toRank, targetRow?.key || '')
+        showMarginMoveNotice(anchorKey, fromRank, toRank, targetRow?.id || targetRow?.key || '')
         await renderMargins()
       }
     }
@@ -982,12 +1525,43 @@ async function trackProductsBatch (productKeys, options = {}) {
 
 
 
-function getMaxSlot (snapshot, keyOverride = null) {
+function getMaxSlot (snapshot, keyOverride = null, options = {}) {
   if (snapshot?.grouped && snapshot?.max && snapshot.max.price != null) return snapshot.max
   if (!keyOverride && !selectedProduct?.key && snapshot?.max && snapshot.max.price != null) return snapshot.max
-  const key = keyOverride || selectedProduct?.key
-  const orderSlots = (snapshot?.slots || []).filter((slot) => slot.order && slotMatchesKey(slot, key))
+  const key = normalizeItemKey(keyOverride || selectedProduct?.key)
+  if (!key) return null
+  const explicitSignature = Object.prototype.hasOwnProperty.call(options, 'variantSignature')
+    ? String(options.variantSignature || '')
+    : null
+  const signature = explicitSignature
+    ? explicitSignature
+    : ((keyOverride && normalizeItemKey(keyOverride) !== normalizeItemKey(selectedProduct?.key))
+        ? ''
+        : String(selectedProduct?.variantSignature || ''))
+  const hint = options.hint || ((!keyOverride || key === normalizeItemKey(selectedProduct?.key)) ? selectedProduct?.variantHint : null)
+  const hintPriceRaw = Number(hint?.price)
+  const hintPrice = Number.isFinite(hintPriceRaw) ? hintPriceRaw : null
+  const hintUser = String(hint?.userName || '').trim().toLowerCase()
+  const orderSlots = (snapshot?.slots || []).filter((slot) => {
+    if (!slot?.order) return false
+    if (!slotMatchesKey(slot, key)) return false
+    return slotMatchesVariant(slot, signature)
+  })
+  if (orderSlots.length === 0 && options.fallbackAny) {
+    for (const slot of snapshot?.slots || []) {
+      if (!slot?.order) continue
+      if (!slotMatchesKey(slot, key)) continue
+      orderSlots.push(slot)
+    }
+  }
   orderSlots.sort((a, b) => {
+    if (hintPrice != null) {
+      const aUser = String(a.order.userName || '').trim().toLowerCase()
+      const bUser = String(b.order.userName || '').trim().toLowerCase()
+      const aMatch = Math.abs((a.order.price || 0) - hintPrice) < 1e-9 && (!hintUser || aUser === hintUser)
+      const bMatch = Math.abs((b.order.price || 0) - hintPrice) < 1e-9 && (!hintUser || bUser === hintUser)
+      if (aMatch !== bMatch) return aMatch ? -1 : 1
+    }
     if (b.order.price !== a.order.price) return b.order.price - a.order.price
     return b.order.amountOrdered - a.order.amountOrdered
   })
@@ -997,7 +1571,8 @@ function getMaxSlot (snapshot, keyOverride = null) {
     amountOrdered: orderSlots[0].order.amountOrdered,
     amountDelivered: orderSlots[0].order.amountDelivered,
     slot: orderSlots[0].slot,
-    userName: orderSlots[0].order.userName
+    userName: orderSlots[0].order.userName,
+    enchantments: normalizeEnchantments(orderSlots[0].order.enchantments || [])
   }
 }
 
@@ -1024,6 +1599,7 @@ async function loadSnapshots () {
 
     if (Array.isArray(data) && data.length > 0) {
       snapshots = data
+      buildTrackedIndexes()
       if (!selectedProduct) {
         const latest = snapshots[snapshots.length - 1]
         const catalogItem = itemsCatalog.find((item) => item.name === latest.productKey)
@@ -1031,10 +1607,13 @@ async function loadSnapshots () {
         setSelectedProduct(catalogItem || fallbackItem)
         return
       }
-    } else if (snapshots.length === 0) {
+      refreshVariantOptions({ preserve: true })
+    } else {
       snapshots = []
+      buildTrackedIndexes()
       activeSnapshot = null
       activeSnapshotLocked = false
+      refreshVariantOptions({ preserve: true })
     }
 
     renderChart()
@@ -1044,6 +1623,10 @@ async function loadSnapshots () {
     }
   } catch (err) {
     console.error(err)
+    snapshots = []
+    trackedOrdersByVariant = new Map()
+    trackedVariantsByBase = new Map()
+    refreshVariantOptions({ preserve: true })
   }
 }
 
@@ -1079,6 +1662,7 @@ function getLatestSnapshotMap () {
 }
 
 function renderCraftSection () {
+  renderVariantPicker()
   craftSummary.innerHTML = ''
   craftList.innerHTML = ''
 
@@ -1087,39 +1671,59 @@ function renderCraftSection () {
     return
   }
 
-  const latestMap = getLatestSnapshotMap()
+  const selectedSignature = String(selectedProduct?.variantSignature || '')
+  const selectedEnchantments = normalizeEnchantments(selectedProduct?.variantEnchantments || [])
+  const selectedOption = selectedVariantOptions.find((entry) => entry.id === selectedProduct?.variantOptionId) || null
   const resultCount = activeRecipe.result?.count || 1
-
-  let productUnitPrice = null
-  if (chartMode === 'grouped') {
-    const groupedItem = latestGroupedRun?.items?.get(selectedProduct?.key)
-    productUnitPrice = groupedItem?.best?.price ?? null
-  } else {
-    const productSnapshot = activeSnapshot
-    const productMax = productSnapshot ? getMaxSlot(productSnapshot, selectedProduct?.key) : null
-    productUnitPrice = productMax?.price ?? null
-  }
+  const productStats = getPreferredPriceStats(selectedProduct?.key, null, {
+    variantSignature: selectedSignature
+  })
+  const hintedPrice = Number(selectedOption?.hint?.price)
+  const productUnitPrice = Number.isFinite(hintedPrice)
+    ? hintedPrice
+    : (productStats?.max ?? null)
 
   let craftCost = 0
   let craftCostKnown = true
+  const components = activeRecipe.ingredients.map((ingredient) => ({
+    type: 'ingredient',
+    key: normalizeItemKey(ingredient.name),
+    displayName: ingredient.displayName || getGroupedDisplayName(ingredient.name),
+    qtyPerUnit: ingredient.count / resultCount,
+    variantSignature: '',
+    enchantments: []
+  }))
 
-  for (const ingredient of activeRecipe.ingredients) {
-    let unitPrice = null
-    if (chartMode === 'grouped') {
-      const groupedItem = latestGroupedRun?.items?.get(ingredient.name)
-      unitPrice = groupedItem?.best?.price ?? null
-    } else {
-      const latest = latestMap.get(ingredient.name)
-      const max = latest ? getMaxSlot(latest, ingredient.name) : null
-      unitPrice = max?.price ?? null
-    }
-    const qtyPerUnit = ingredient.count / resultCount
-    if (unitPrice == null) {
+  selectedEnchantments.forEach((enchantment) => {
+    components.push({
+      type: 'book',
+      key: 'enchanted_book',
+      displayName: `Enchanted Book (${formatEnchantName(enchantment.name)} ${toRomanLevel(enchantment.level)})`,
+      qtyPerUnit: 1,
+      variantSignature: buildEnchantSignature([enchantment]),
+      enchantments: [enchantment]
+    })
+  })
+
+  const pricedComponents = components.map((component) => {
+    const stats = getPreferredPriceStats(component.key, null, {
+      variantSignature: component.variantSignature,
+      allowAny: component.type === 'book'
+    })
+    const unitPrice = stats?.max ?? null
+    const totalCost = unitPrice != null ? unitPrice * component.qtyPerUnit : null
+    if (totalCost == null) {
       craftCostKnown = false
-      continue
+    } else {
+      craftCost += totalCost
     }
-    craftCost += unitPrice * qtyPerUnit
-  }
+    return {
+      ...component,
+      unitPrice,
+      totalCost,
+      source: stats?.source || 'grouped'
+    }
+  })
 
   const summary = document.createElement('div')
   summary.className = 'metric'
@@ -1133,7 +1737,7 @@ function renderCraftSection () {
   priceMetric.className = 'metric'
   priceMetric.innerHTML = `
     <strong>Top order price</strong>
-    ${productUnitPrice != null ? formatPrice(productUnitPrice) : 'n/a'}
+    ${productUnitPrice != null ? formatPrice(Math.round(productUnitPrice)) : 'n/a'}
   `
   craftSummary.appendChild(priceMetric)
 
@@ -1152,68 +1756,112 @@ function renderCraftSection () {
   `
   craftSummary.appendChild(marginMetric)
 
-  for (const ingredient of activeRecipe.ingredients) {
-    let unitPrice = null
-    if (chartMode === 'grouped') {
-      const groupedItem = latestGroupedRun?.items?.get(ingredient.name)
-      unitPrice = groupedItem?.best?.price ?? null
-    } else {
-      const latest = latestMap.get(ingredient.name)
-      const max = latest ? getMaxSlot(latest, ingredient.name) : null
-      unitPrice = max?.price ?? null
+  if (selectedEnchantments.length > 0) {
+    const booksMetric = document.createElement('div')
+    booksMetric.className = 'metric'
+    booksMetric.innerHTML = `
+      <strong>Books</strong>
+      <div class="craft-book-actions">
+        <button data-book-track="once" type="button">Track once</button>
+        <button data-book-track="always" type="button">Track always</button>
+      </div>
+    `
+    const onceButton = booksMetric.querySelector('[data-book-track="once"]')
+    const alwaysButton = booksMetric.querySelector('[data-book-track="always"]')
+    if (onceButton) {
+      onceButton.addEventListener('click', (event) => {
+        event.stopPropagation()
+        trackProductsBatch(['enchanted_book'], { once: true, anchorKey: selectedProduct?.key || 'enchanted_book' })
+      })
     }
-    const qtyPerUnit = ingredient.count / resultCount
-    const totalCost = unitPrice != null ? unitPrice * qtyPerUnit : null
-    const item = itemsCatalog.find((i) => i.name === ingredient.name)
-    const displayName = item?.displayName || ingredient.displayName || ingredient.name
-    const isTracked = trackedKeys.has(ingredient.name)
-    const aliasValue = aliasMap.get(ingredient.name) || displayName
+    if (alwaysButton) {
+      alwaysButton.addEventListener('click', (event) => {
+        event.stopPropagation()
+        trackProductsBatch(['enchanted_book'], { once: false, anchorKey: selectedProduct?.key || 'enchanted_book' })
+      })
+    }
+    craftSummary.appendChild(booksMetric)
+  }
+
+  for (const component of pricedComponents) {
+    const item = itemsCatalog.find((i) => i.name === component.key)
+    const displayName = component.displayName || item?.displayName || component.key
+    const isTracked = trackedKeys.has(component.key)
+    const aliasValue = aliasMap.get(component.key) || displayName
+    const sourceLabel = component.source === 'tracked' ? 'tracked' : 'grouped'
 
     const row = document.createElement('div')
     row.className = 'craft-item'
+    const controlsHtml = component.type === 'book'
+      ? `
+        <div class="craft-book-actions">
+          <button data-book-action="once" type="button">Once</button>
+          <button data-book-action="always" type="button">Always</button>
+        </div>
+      `
+      : `
+        <button class="${isTracked ? 'tracking' : ''}" data-item-action="toggle">${isTracked ? 'Tracking' : 'Track'}</button>
+        <input class="alias-input craft-alias" value="${aliasValue}" placeholder="orders query" />
+      `
     row.innerHTML = `
       <div class="item-info">
-        <div class="item-thumb"><img src="${itemIconUrl(item || { name: ingredient.name })}" alt="" /></div>
+        <div class="item-thumb"><img src="${itemIconUrl(item || { name: component.key })}" alt="" /></div>
         <div>
           <div class="item-name">${displayName}</div>
           <div class="item-actions">
-            <button class="${isTracked ? 'tracking' : ''}">${isTracked ? 'Tracking' : 'Track'}</button>
-            <input class="alias-input craft-alias" value="${aliasValue}" placeholder="orders query" />
+            ${controlsHtml}
             <div class="metrics">
-              <strong>${qtyPerUnit % 1 === 0 ? qtyPerUnit : qtyPerUnit.toFixed(2)}x</strong>
-              <div>Unit: ${unitPrice != null ? formatPrice(unitPrice) : 'n/a'}</div>
-              <div>${totalCost != null ? formatPrice(Math.round(totalCost)) : 'n/a'}</div>
+              <strong>${component.qtyPerUnit % 1 === 0 ? component.qtyPerUnit : component.qtyPerUnit.toFixed(2)}x</strong>
+              <div>Unit: ${component.unitPrice != null ? formatPrice(Math.round(component.unitPrice)) : 'n/a'} (${sourceLabel})</div>
+              <div>${component.totalCost != null ? formatPrice(Math.round(component.totalCost)) : 'n/a'}</div>
             </div>
           </div>
         </div>
       </div>
     `
 
-    const button = row.querySelector('button')
-    if (button) {
-      button.addEventListener('click', (event) => {
-        event.stopPropagation()
-        const input = row.querySelector('.alias-input')
-        const commandName = input ? input.value.trim() : ''
-        toggleTrack(ingredient.name, commandName)
-      })
-    }
+    if (component.type === 'book') {
+      const onceButton = row.querySelector('[data-book-action="once"]')
+      const alwaysButton = row.querySelector('[data-book-action="always"]')
+      if (onceButton) {
+        onceButton.addEventListener('click', (event) => {
+          event.stopPropagation()
+          trackProductsBatch(['enchanted_book'], { once: true, anchorKey: selectedProduct?.key || 'enchanted_book' })
+        })
+      }
+      if (alwaysButton) {
+        alwaysButton.addEventListener('click', (event) => {
+          event.stopPropagation()
+          trackProductsBatch(['enchanted_book'], { once: false, anchorKey: selectedProduct?.key || 'enchanted_book' })
+        })
+      }
+    } else {
+      const button = row.querySelector('[data-item-action="toggle"]')
+      if (button) {
+        button.addEventListener('click', (event) => {
+          event.stopPropagation()
+          const input = row.querySelector('.alias-input')
+          const commandName = input ? input.value.trim() : ''
+          toggleTrack(component.key, commandName)
+        })
+      }
 
-    const aliasInput = row.querySelector('.alias-input')
-    if (aliasInput) {
-      aliasInput.addEventListener('click', (event) => {
-        event.stopPropagation()
-      })
-      aliasInput.addEventListener('change', () => {
-        applyAlias(ingredient.name, aliasInput.value)
-      })
-      aliasInput.addEventListener('keydown', (event) => {
-        event.stopPropagation()
-        if (event.key === 'Enter') {
-          event.preventDefault()
-          aliasInput.blur()
-        }
-      })
+      const aliasInput = row.querySelector('.alias-input')
+      if (aliasInput) {
+        aliasInput.addEventListener('click', (event) => {
+          event.stopPropagation()
+        })
+        aliasInput.addEventListener('change', () => {
+          applyAlias(component.key, aliasInput.value)
+        })
+        aliasInput.addEventListener('keydown', (event) => {
+          event.stopPropagation()
+          if (event.key === 'Enter') {
+            event.preventDefault()
+            aliasInput.blur()
+          }
+        })
+      }
     }
 
     craftList.appendChild(row)
@@ -1255,6 +1903,7 @@ async function loadAllPages () {
     const data = await res.json()
     allPages = Array.isArray(data) ? data : []
     buildGroupedRuns()
+    refreshVariantOptions({ preserve: true })
     renderGroupedSearch()
     renderGroupedSummary()
     if (chartMode === 'grouped') {
@@ -1270,6 +1919,10 @@ async function loadAllPages () {
     latestGroupedRun = null
     groupedOrdersByItem = new Map()
     groupedItemCounts = new Map()
+    groupedOrdersByVariant = new Map()
+    groupedVariantsByBase = new Map()
+    groupedVariantMetaByBase = new Map()
+    refreshVariantOptions({ preserve: true })
     renderGroupedSearch()
     renderGroupedSummary()
     renderMargins()
@@ -1313,7 +1966,8 @@ async function triggerSearchAll () {
 }
 
 function getGroupedDisplayName (key) {
-  const normalized = normalizeItemKey(key)
+  const baseKey = String(key || '').includes('::') ? String(key).split('::')[0] : key
+  const normalized = normalizeItemKey(baseKey)
   if (!normalized) return key || '—'
   const fromCatalog = itemsCatalog.find((item) => item.name === normalized)
   if (fromCatalog?.displayName) return fromCatalog.displayName
@@ -1325,10 +1979,17 @@ function getGroupedDisplayName (key) {
   return normalized
 }
 
-function getGroupedProductRecords (productKey = selectedProduct?.key) {
+function getGroupedProductRecords (productKey = selectedProduct?.key, options = {}) {
   const normalized = normalizeItemKey(productKey)
   if (!normalized) return []
-  const records = [...(groupedOrdersByItem.get(normalized) || [])]
+  const signature = Object.prototype.hasOwnProperty.call(options, 'signature')
+    ? String(options.signature || '')
+    : String(selectedProduct?.variantSignature || '')
+  const variantKey = buildVariantKey(normalized, signature)
+  let records = [...(groupedOrdersByVariant.get(variantKey) || [])]
+  if (records.length === 0 && options.allowAny) {
+    records = [...(groupedOrdersByItem.get(normalized) || [])]
+  }
   records.sort((a, b) => {
     if (b.price !== a.price) return b.price - a.price
     const aTs = a.ts ? new Date(a.ts).getTime() : 0
@@ -1338,96 +1999,58 @@ function getGroupedProductRecords (productKey = selectedProduct?.key) {
   return records
 }
 
-function getGroupedPriceStats (productKey, sinceMs) {
-  const records = getGroupedProductRecords(productKey)
-  if (!records.length) return null
-  const cutoff = Number.isFinite(sinceMs) && sinceMs > 0 ? Date.now() - sinceMs : null
-
-  let min = Infinity
-  let max = -Infinity
-  let sum = 0
-  let count = 0
-  let latestTs = 0
-  let latestPrice = null
-
-  for (const record of records) {
-    const price = Number(record.price)
-    if (!Number.isFinite(price)) continue
-    const tsMs = record.ts ? new Date(record.ts).getTime() : 0
-    if (cutoff != null && tsMs && tsMs < cutoff) continue
-
-    sum += price
-    count += 1
-    if (price < min) min = price
-    if (price > max) max = price
-    if (tsMs >= latestTs) {
-      latestTs = tsMs
-      latestPrice = price
-    }
-  }
-
-  if (count === 0) return null
+function getGroupedPriceStats (productKey, sinceMs, options = {}) {
+  const signature = Object.prototype.hasOwnProperty.call(options, 'variantSignature')
+    ? String(options.variantSignature || '')
+    : ''
+  const records = getGroupedProductRecords(productKey, { signature, allowAny: options.allowAny })
+  const summary = summarizeVariantRecords(records, sinceMs)
+  if (!summary) return null
   return {
-    avg: sum / count,
-    min,
-    max,
-    latest: latestPrice,
-    count
+    avg: summary.avg,
+    min: summary.min,
+    max: summary.max,
+    latest: summary.latest,
+    count: summary.count,
+    topRecord: summary.topRecord,
+    signature
   }
 }
 
-function getTrackedPriceStats (productKey, sinceMs) {
+function getTrackedPriceStats (productKey, sinceMs, options = {}) {
   const normalized = normalizeItemKey(productKey)
   if (!normalized) return null
-  const cutoff = Number.isFinite(sinceMs) && sinceMs > 0 ? Date.now() - sinceMs : null
-  const sourceSnapshots = Array.isArray(snapshots) ? snapshots : []
-
-  let min = Infinity
-  let max = -Infinity
-  let sum = 0
-  let count = 0
-  let latestTs = 0
-  let latestPrice = null
-
-  for (const snapshot of sourceSnapshots) {
-    if (!snapshot) continue
-    if (normalizeItemKey(snapshot.productKey) !== normalized) continue
-    const tsMs = snapshot.ts ? new Date(snapshot.ts).getTime() : 0
-    if (cutoff != null && tsMs && tsMs < cutoff) continue
-
-    const top = getMaxSlot(snapshot, normalized)
-    const price = Number(top?.price)
-    if (!Number.isFinite(price)) continue
-
-    sum += price
-    count += 1
-    if (price < min) min = price
-    if (price > max) max = price
-    if (tsMs >= latestTs) {
-      latestTs = tsMs
-      latestPrice = price
-    }
+  const bySignature = trackedVariantsByBase.get(normalized)
+  if (!bySignature || bySignature.size === 0) return null
+  const signature = Object.prototype.hasOwnProperty.call(options, 'variantSignature')
+    ? String(options.variantSignature || '')
+    : ''
+  let records = bySignature.get(signature) || []
+  if ((!records || records.length === 0) && options.allowAny) {
+    records = Array.from(bySignature.values()).flat()
   }
-
-  if (count === 0) return null
+  const summary = summarizeVariantRecords(records, sinceMs)
+  if (!summary) return null
   return {
-    avg: sum / count,
-    min,
-    max,
-    latest: latestPrice,
-    count
+    avg: summary.avg,
+    min: summary.min,
+    max: summary.max,
+    latest: summary.latest,
+    count: summary.count,
+    topRecord: summary.topRecord,
+    signature
   }
 }
 
-function getPreferredPriceStats (productKey, sinceMs) {
-  const trackedStats = getTrackedPriceStats(productKey, sinceMs)
+function getPreferredPriceStats (productKey, sinceMs, options = {}) {
+  const trackedStats = getTrackedPriceStats(productKey, sinceMs, options)
   if (trackedStats) {
     return {
       ...trackedStats,
       source: 'tracked'
     }
   }
-  const groupedStats = getGroupedPriceStats(productKey, sinceMs)
+  const groupedStats = getGroupedPriceStats(productKey, sinceMs, options)
   if (!groupedStats) return null
   return {
     ...groupedStats,
@@ -1506,19 +2129,25 @@ function getMarginsSearchCandidates (query) {
 
   if (tokens.length === 0) {
     return source.slice(0, 40).map((row) => ({
-      key: normalizeItemKey(row.key),
-      displayName: row.displayName || getGroupedDisplayName(row.key),
-      margin: row.margin
+      id: row.id,
+      baseKey: row.baseKey,
+      signature: row.signature || '',
+      displayName: row.displayName || getGroupedDisplayName(row.baseKey),
+      margin: row.margin,
+      topUserName: row.topUserName || ''
     }))
   }
 
   return source
-    .filter((row) => matchesQuery(`${row.displayName || row.name || row.key} ${row.key}`, tokens))
+    .filter((row) => matchesQuery(`${row.displayName || row.name || row.baseKey} ${row.baseKey}`, tokens))
     .slice(0, 40)
     .map((row) => ({
-      key: normalizeItemKey(row.key),
-      displayName: row.displayName || getGroupedDisplayName(row.key),
-      margin: row.margin
+      id: row.id,
+      baseKey: row.baseKey,
+      signature: row.signature || '',
+      displayName: row.displayName || getGroupedDisplayName(row.baseKey),
+      margin: row.margin,
+      topUserName: row.topUserName || ''
     }))
 }
 
@@ -1537,7 +2166,7 @@ function renderMarginsSearch () {
     const button = document.createElement('button')
     button.type = 'button'
     button.className = 'grouped-search-item'
-    if (selectedProduct?.key === candidate.key) {
+    if (selectedProduct?.key === candidate.baseKey && String(selectedProduct?.variantSignature || '') === String(candidate.signature || '')) {
       button.classList.add('active')
     }
     button.innerHTML = `
@@ -1548,7 +2177,12 @@ function renderMarginsSearch () {
       if (marginsSearchInput) {
         marginsSearchInput.value = candidate.displayName
       }
-      setSelectedProduct({ name: candidate.key, displayName: candidate.displayName })
+      setSelectedProduct(
+        { name: candidate.baseKey, displayName: getGroupedDisplayName(candidate.baseKey) },
+        {
+          signature: candidate.signature
+        }
+      )
       if (activeTab !== 'margins') {
         setActiveTab('margins')
       } else {
@@ -1671,7 +2305,8 @@ function renderGroupedSummary () {
   }
 
   const latestTs = records.find((record) => record.ts)?.ts || null
-  groupedMeta.textContent = `Records: ${records.length} • Last seen: ${latestTs ? formatDateTime(latestTs) : '—'}`
+  const variantLabel = formatEnchantmentsCompact(selectedProduct?.variantEnchantments || [], 2)
+  groupedMeta.textContent = `Records: ${records.length} • Variant: ${variantLabel} • Last seen: ${latestTs ? formatDateTime(latestTs) : '—'}`
   renderGroupedRecordsChart(records)
 
   const displayName = getGroupedDisplayName(selectedProduct.key)
@@ -1683,7 +2318,7 @@ function renderGroupedSummary () {
     const slotLabel = record.slot == null ? '' : ` • Slot ${record.slot}`
     row.innerHTML = `
       <div class="grouped-record-main">
-        <div class="item-name">${displayName}</div>
+        <div class="item-name">${formatVariantDisplayName(displayName, record.enchantments || selectedProduct?.variantEnchantments || [])}</div>
         <div class="item-meta">${record.userName} • ${timeLabel} • Page ${record.page}${slotLabel}</div>
       </div>
       <div class="grouped-record-price">${formatPrice(record.price)}</div>
@@ -1819,8 +2454,7 @@ async function fetchRecipeCached (itemKey) {
 async function renderMargins () {
   if (!marginsList) return
   marginsList.innerHTML = '<div class="meta">Loading margins…</div>'
-  const run = latestGroupedRun
-  if (!run) {
+  if (!groupedVariantMetaByBase || groupedVariantMetaByBase.size === 0) {
     marginRowsCache = []
     renderMarginsSearch()
     marginsList.innerHTML = '<div class="meta">Run a grouped scan to calculate margins.</div>'
@@ -1830,7 +2464,11 @@ async function renderMargins () {
 
   const hours = Number(marginsHours) || 24
   const sinceMs = hours * 60 * 60 * 1000
-  const candidates = Array.from(run.items.values())
+  const candidates = []
+  for (const variants of groupedVariantMetaByBase.values()) {
+    if (!Array.isArray(variants)) continue
+    candidates.push(...variants)
+  }
   const formatQty = (value) => {
     if (!Number.isFinite(value)) return '0'
     if (Math.abs(value - Math.round(value)) < 1e-9) return `${Math.round(value)}`
@@ -1840,41 +2478,76 @@ async function renderMargins () {
 
   const rows = []
   for (const entry of candidates) {
-    const productStats = getPreferredPriceStats(entry.key, sinceMs)
+    const baseKey = normalizeItemKey(entry?.key || '')
+    if (!baseKey) continue
+    const signature = String(entry?.signature || '')
+    const enchantments = normalizeEnchantments(entry?.enchantments || [])
+    const productStats = getPreferredPriceStats(baseKey, sinceMs, { variantSignature: signature })
     if (!productStats) continue
-    const recipe = await fetchRecipeCached(entry.key)
+    const recipe = await fetchRecipeCached(baseKey)
     if (!recipe || !recipe.ingredients || recipe.ingredients.length === 0) continue
 
     let craftCost = 0
     let craftKnown = true
     const materialDetails = []
     const resultCount = recipe.result?.count || 1
-    for (const ingredient of recipe.ingredients) {
-      const ingredientStats = getPreferredPriceStats(ingredient.name, sinceMs)
+    const components = recipe.ingredients.map((ingredient) => ({
+      type: 'ingredient',
+      key: normalizeItemKey(ingredient.name),
+      displayName: ingredient.displayName || getGroupedDisplayName(ingredient.name),
+      qtyPerUnit: ingredient.count / resultCount,
+      variantSignature: ''
+    }))
+    enchantments.forEach((enchant) => {
+      components.push({
+        type: 'book',
+        key: 'enchanted_book',
+        displayName: `Enchanted Book (${formatEnchantName(enchant.name)} ${toRomanLevel(enchant.level)})`,
+        qtyPerUnit: 1,
+        variantSignature: buildEnchantSignature([enchant]),
+        enchantments: [enchant]
+      })
+    })
+
+    for (const component of components) {
+      const ingredientStats = getPreferredPriceStats(component.key, sinceMs, {
+        variantSignature: component.variantSignature,
+        allowAny: component.type === 'book'
+      })
       if (!ingredientStats) {
         craftKnown = false
         break
       }
-      const qtyPerUnit = ingredient.count / resultCount
+      const qtyPerUnit = component.qtyPerUnit
       const unitPrice = ingredientStats.max
       const totalCost = unitPrice * qtyPerUnit
       craftCost += totalCost
+      const materialId = component.type === 'book'
+        ? buildVariantKey(component.key, component.variantSignature)
+        : normalizeItemKey(component.key)
       materialDetails.push({
-        key: normalizeItemKey(ingredient.name),
-        displayName: ingredient.displayName || getGroupedDisplayName(ingredient.name),
+        id: materialId,
+        key: normalizeItemKey(component.key),
+        variantSignature: component.variantSignature,
+        displayName: component.displayName || getGroupedDisplayName(component.key),
         qtyPerUnit,
         unitPrice,
         totalCost,
-        source: sourceLabel(ingredientStats.source)
+        source: sourceLabel(ingredientStats.source),
+        type: component.type
       })
     }
     if (!craftKnown) continue
     const sellPrice = productStats.max
     const margin = sellPrice - craftCost
-    const key = normalizeItemKey(entry.key)
-    const displayName = getGroupedDisplayName(key)
+    const rowId = buildVariantKey(baseKey, signature)
+    const displayName = formatVariantDisplayName(getGroupedDisplayName(baseKey), enchantments)
     rows.push({
-      key,
+      id: rowId,
+      key: rowId,
+      baseKey,
+      signature,
+      enchantments,
       displayName,
       name: entry.name,
       sellPrice,
@@ -1884,7 +2557,9 @@ async function renderMargins () {
       points: productStats.count,
       sellSource: sourceLabel(productStats.source),
       recipe,
-      materials: materialDetails
+      materials: materialDetails,
+      hasBooks: enchantments.length > 0,
+      topUserName: productStats.topRecord?.userName || '—'
     })
   }
 
@@ -1898,18 +2573,19 @@ async function renderMargins () {
     .split(/[\s,]+/)
     .filter((token) => token.length > 0)
   const visibleRows = queryTokens.length > 0
-    ? rows.filter((row) => matchesQuery(`${row.displayName} ${row.key}`, queryTokens))
+    ? rows.filter((row) => matchesQuery(`${row.displayName} ${row.baseKey} ${formatEnchantmentsCompact(row.enchantments || [], 4)}`, queryTokens))
     : rows
 
   if (marginMoveNotice && marginMoveNotice.expiresAt < Date.now()) {
     marginMoveNotice = null
   }
   if (marginsUpdateNotice) {
+    const rowNameMap = new Map(rows.map((row) => [row.id, row.displayName]))
     if (marginMoveNotice) {
       marginsUpdateNotice.hidden = false
-      const name = getGroupedDisplayName(marginMoveNotice.key)
+      const name = rowNameMap.get(marginMoveNotice.key) || getGroupedDisplayName(marginMoveNotice.key)
       const targetName = marginMoveNotice.targetKey
-        ? getGroupedDisplayName(marginMoveNotice.targetKey)
+        ? (rowNameMap.get(marginMoveNotice.targetKey) || getGroupedDisplayName(marginMoveNotice.targetKey))
         : ''
       marginsUpdateNotice.textContent = targetName && targetName !== name
         ? `${name} moved down from #${marginMoveNotice.from} to #${marginMoveNotice.to} (below ${targetName})`
@@ -1941,13 +2617,13 @@ async function renderMargins () {
   for (const row of visibleRows.slice(0, 80)) {
     const node = document.createElement('div')
     node.className = 'margin-row'
-    const isPendingRow = marginTrackingPendingKeys.has(row.key)
-    const isMovedDown = marginMoveNotice && marginMoveNotice.key === row.key && marginMoveNotice.expiresAt >= Date.now()
+    const isPendingRow = marginTrackingPendingKeys.has(row.id) || marginTrackingPendingKeys.has(row.baseKey)
+    const isMovedDown = marginMoveNotice && marginMoveNotice.key === row.id && marginMoveNotice.expiresAt >= Date.now()
     if (isPendingRow) node.classList.add('pending')
     if (isMovedDown) node.classList.add('rank-moved-down')
     const materialsHtml = row.materials
       .map((material) => `
-        <div class="margin-material-chip${marginTrackingPendingKeys.has(material.key) ? ' pending' : ''}">
+        <div class="margin-material-chip${marginTrackingPendingKeys.has(material.id) || marginTrackingPendingKeys.has(material.key) ? ' pending' : ''}">
           <div class="item-thumb"><img src="${itemIconUrl({ name: material.key })}" alt="" /></div>
           <div class="margin-material-info">
             <div class="margin-material-name">${material.displayName} x${formatQty(material.qtyPerUnit)}</div>
@@ -1960,7 +2636,7 @@ async function renderMargins () {
     node.innerHTML = `
       <div class="margin-row-main">
         <div class="margin-item">
-          <div class="item-thumb"><img src="${itemIconUrl({ name: row.key })}" alt="" /></div>
+          <div class="item-thumb"><img src="${itemIconUrl({ name: row.baseKey })}" alt="" /></div>
           <div>
             <div class="item-name">${row.displayName}</div>
             <div class="meta">Top sell (${hours}h) from ${row.sellSource} • samples ${row.points}</div>
@@ -1983,6 +2659,8 @@ async function renderMargins () {
           <button data-action="item-always" type="button" ${isPendingRow ? 'disabled' : ''}>Track Item Always</button>
           <button data-action="materials-once" type="button" ${isPendingRow ? 'disabled' : ''}>Track Mats Once</button>
           <button data-action="materials-always" type="button" ${isPendingRow ? 'disabled' : ''}>Track Mats Always</button>
+          ${row.hasBooks ? `<button data-action="books-once" type="button" ${isPendingRow ? 'disabled' : ''}>Track Books Once</button>` : ''}
+          ${row.hasBooks ? `<button data-action="books-always" type="button" ${isPendingRow ? 'disabled' : ''}>Track Books Always</button>` : ''}
         </div>
       </div>
       <div class="margin-materials">
@@ -1997,26 +2675,63 @@ async function renderMargins () {
         event.stopPropagation()
         const action = button.getAttribute('data-action')
         if (action === 'item-once') {
-          await trackProductsBatch([row.key], { once: true, anchorKey: row.key })
+          await trackProductsBatch([row.baseKey], { once: true, anchorKey: row.id, highlightRowIds: [row.id] })
           return
         }
         if (action === 'item-always') {
-          await trackProductsBatch([row.key], { once: false, anchorKey: row.key })
+          await trackProductsBatch([row.baseKey], { once: false, anchorKey: row.id, highlightRowIds: [row.id] })
           return
         }
-        const materialKeys = row.materials.map((material) => material.key)
+        const materialKeys = [...new Set(row.materials.map((material) => material.key).filter(Boolean))]
         if (action === 'materials-once') {
-          await trackProductsBatch(materialKeys, { once: true, anchorKey: row.key, highlightKeys: [row.key] })
+          await trackProductsBatch(materialKeys, {
+            once: true,
+            anchorKey: row.id,
+            highlightKeys: materialKeys,
+            highlightRowIds: [row.id]
+          })
           return
         }
         if (action === 'materials-always') {
-          await trackProductsBatch(materialKeys, { once: false, anchorKey: row.key, highlightKeys: [row.key] })
+          await trackProductsBatch(materialKeys, {
+            once: false,
+            anchorKey: row.id,
+            highlightKeys: materialKeys,
+            highlightRowIds: [row.id]
+          })
+          return
+        }
+        if (action === 'books-once') {
+          await trackProductsBatch(['enchanted_book'], {
+            once: true,
+            anchorKey: row.id,
+            highlightKeys: ['enchanted_book'],
+            highlightRowIds: [row.id]
+          })
+          return
+        }
+        if (action === 'books-always') {
+          await trackProductsBatch(['enchanted_book'], {
+            once: false,
+            anchorKey: row.id,
+            highlightKeys: ['enchanted_book'],
+            highlightRowIds: [row.id]
+          })
         }
       })
     })
 
     node.addEventListener('click', () => {
-      setSelectedProduct({ name: row.key, displayName: row.displayName })
+      setSelectedProduct(
+        { name: row.baseKey, displayName: getGroupedDisplayName(row.baseKey) },
+        {
+          signature: row.signature,
+          hint: {
+            price: row.sellPrice,
+            userName: row.topUserName
+          }
+        }
+      )
       setActiveTab('grouped')
     })
     marginsList.appendChild(node)
@@ -2035,7 +2750,9 @@ function getAlertHitIndexes (snapshotsList) {
 
   for (let i = 0; i < snapshotsList.length; i += 1) {
     const snapshot = snapshotsList[i]
-    const max = getMaxSlot(snapshot, selectedProduct.key)
+    const max = getMaxSlot(snapshot, selectedProduct.key, {
+      variantSignature: selectedProduct?.variantSignature || ''
+    })
     if (!max || !Number.isFinite(max.price)) continue
     const price = max.price
     const orderedQty = Number(max.amountOrdered) || 0
@@ -2082,6 +2799,9 @@ function renderChart () {
   ctx.clearRect(0, 0, rect.width, rect.height)
 
   chartSnapshots = chartMode === 'grouped' ? getFilteredGroupedSeries() : getFilteredSnapshots()
+  if (chartMode === 'snapshot' && selectedProduct?.key) {
+    chartSnapshots = chartSnapshots.filter((snapshot) => !!getMaxSlot(snapshot))
+  }
   chartOutlierBoxes = []
 
   if (chartSnapshots.length === 0) {
@@ -2421,6 +3141,22 @@ function renderGrid (snapshot) {
   }
 
   const matchingSlots = rawSlots.filter((slot) => slot && slotMatchesSelected(slot))
+  const hintPriceRaw = Number(selectedProduct?.variantHint?.price)
+  const hintPrice = Number.isFinite(hintPriceRaw) ? hintPriceRaw : null
+  const hintUser = String(selectedProduct?.variantHint?.userName || '').trim().toLowerCase()
+  matchingSlots.sort((a, b) => {
+    if (hintPrice != null) {
+      const aUser = String(a?.order?.userName || '').trim().toLowerCase()
+      const bUser = String(b?.order?.userName || '').trim().toLowerCase()
+      const aMatch = Math.abs((a?.order?.price || 0) - hintPrice) < 1e-9 && (!hintUser || aUser === hintUser)
+      const bMatch = Math.abs((b?.order?.price || 0) - hintPrice) < 1e-9 && (!hintUser || bUser === hintUser)
+      if (aMatch !== bMatch) return aMatch ? -1 : 1
+    }
+    if ((b?.order?.price || 0) !== (a?.order?.price || 0)) {
+      return (b?.order?.price || 0) - (a?.order?.price || 0)
+    }
+    return (b?.order?.amountOrdered || 0) - (a?.order?.amountOrdered || 0)
+  })
   const otherSlots = rawSlots.filter((slot) => !slot || !slotMatchesSelected(slot))
   const displaySlots = [...matchingSlots, ...otherSlots]
 
@@ -2621,6 +3357,22 @@ async function init () {
   renderRangeControls()
   renderChartModeControls()
   renderOrderConfigSelectors()
+  if (variantPickerButton && variantPicker && variantPickerMenu) {
+    variantPickerButton.addEventListener('click', (event) => {
+      event.stopPropagation()
+      const isOpen = variantPicker.classList.contains('open')
+      variantPicker.classList.toggle('open', !isOpen)
+      variantPickerMenu.hidden = isOpen
+    })
+    document.addEventListener('click', () => {
+      if (!variantPicker.classList.contains('open')) return
+      variantPicker.classList.remove('open')
+      variantPickerMenu.hidden = true
+    })
+    variantPickerMenu.addEventListener('click', (event) => {
+      event.stopPropagation()
+    })
+  }
   if (searchAllSortSelect) {
     searchAllSortSelect.addEventListener('change', () => {
       orderConfig.searchAllSort = normalizeSortKey(searchAllSortSelect.value, orderConfig.searchAllSort)
