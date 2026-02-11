@@ -65,6 +65,13 @@ const ordersCommandPrefix = process.env.ORDERS_CMD_PREFIX || `/orders`
 const ordersMinMatches = Number(process.env.ORDERS_MIN_MATCHES || 3)
 const ordersPageSearchLimit = Number(process.env.ORDERS_PAGE_SEARCH_LIMIT || 6)
 const ordersPageDelayMs = Number(process.env.ORDERS_PAGE_DELAY_MS || 1200)
+const ordersSpawnProbe = process.env.ORDERS_SPAWN_PROBE !== '0'
+const ordersTraderEnabled = process.env.ORDERS_TRADER_ENABLED === '1'
+const ordersTraderMarginPct = Number(process.env.ORDERS_TRADER_MARGIN_PCT || 0.5)
+const ordersTraderRefreshMinMs = Number(process.env.ORDERS_TRADER_REFRESH_MIN_MS || 500)
+const ordersTraderRefreshMaxMs = Number(process.env.ORDERS_TRADER_REFRESH_MAX_MS || 5490)
+const ordersTraderOwnedSyncMs = Number(process.env.ORDERS_TRADER_OWNED_SYNC_MS || 30000)
+const ordersTraderConfirmTimeoutMs = Number(process.env.ORDERS_TRADER_CONFIRM_TIMEOUT_MS || 5000)
 const alertAverageWindowMs = Number(process.env.ALERT_AVG_WINDOW_MS || 86_400_000)
 const alertUserCooldownMs = Number(process.env.ALERT_USER_COOLDOWN_MS || 300_000)
 const orderSortKeys = new Set([
@@ -84,6 +91,9 @@ const ordersAliasesPath = path.join(__dirname, 'orders-aliases.json')
 const ordersTrackedPath = path.join(__dirname, 'orders-tracked.json')
 const alertsPath = path.join(__dirname, 'orders-alerts.json')
 const ordersConfigPath = path.join(__dirname, 'orders-config.json')
+const ordersOwnedPath = path.join(__dirname, 'orders-owned.json')
+const ordersMarketStatePath = path.join(__dirname, 'orders-market-state.json')
+const ordersTraderDealsPath = path.join(__dirname, 'orders-trader-deals.jsonl')
 
 const minecraft = MinecraftData(version)
 const enchantmentDict = minecraft.enchantmentsArray.reduce((acc, e) => {
@@ -123,6 +133,14 @@ let ordersConfig = {
   searchAllSort: defaultOrderConfig.searchAllSort,
   trackingSort: defaultOrderConfig.trackingSort
 }
+let traderLoopRunning = false
+let traderLastOwnedSyncAt = 0
+let traderOwnedOrders = []
+let traderOwnedByProduct = new Map()
+let traderMarketState = new Map()
+let traderOrderCooldown = new Map()
+let traderYourOrdersChestSlot = null
+let traderRefreshSlot = null
 let alertUserCooldown = new Map()
 const priceHistory = new Map()
 
@@ -138,6 +156,7 @@ loadAlertsConfig()
 loadOrderConfig()
 loadSearchAllLastRun()
 seedPriceHistory()
+loadTraderState()
 
 bot.once('spawn', () => {
   console.log(`Spawned on ${host} as ${bot.username} (version ${version}, auth ${auth})`)
@@ -149,7 +168,21 @@ bot.once('spawn', () => {
   }
 
   startOrdersApiServer()
+  if (ordersSpawnProbe) {
+    setTimeout(() => {
+      runSpawnOrdersProbe().catch((err) => {
+        console.warn('Spawn probe failed:', err && err.message ? err.message : err)
+      })
+    }, 1200)
+  }
   setTimeout(() => {
+    if (ordersTraderEnabled) {
+      runTraderLoop().catch((err) => {
+        console.warn('Trader loop failed:', err && err.message ? err.message : err)
+      })
+      return
+    }
+
     if (ordersAutoTrack) {
       rehydrateTrackedList()
     }
@@ -157,6 +190,7 @@ bot.once('spawn', () => {
   }, ordersStartDelayMs)
 })
 
+// Grupo de tarea: carga/guardado de config runtime (tracked, aliases, alerts, sort).
 function normalizeProductKey (value) {
   return (value || '')
     .toLowerCase()
@@ -353,6 +387,7 @@ function getCommandName (productKey) {
   return getAlias(productKey) || productKey
 }
 
+// Grupo de tarea: scheduler y cola de comandos `/orders` para productos tracked.
 function randomBetween (min, max) {
   const low = Number.isFinite(min) ? min : 0
   const high = Number.isFinite(max) ? max : low
@@ -452,6 +487,7 @@ function startScheduler () {
 }
 
 function schedulerTick () {
+  if (traderLoopRunning) return
   if (searchAllRunning || searchAllRequested) return
   const now = Date.now()
   for (const key of trackedOrder) {
@@ -469,6 +505,7 @@ function schedulerTick () {
 
 function processQueue () {
   if (!enableOrders) return
+  if (traderLoopRunning) return
   if (currentTask || ordersInFlight) return
   if (searchAllRequested && !searchAllRunning) {
     startSearchAll()
@@ -529,6 +566,7 @@ function startSearchAll () {
   console.log(`Search all orders started: ${command}`)
 }
 
+// Grupo de tarea: helpers de parseo GUI (slots, lore, ventanas, probe).
 function windowSignature (window) {
   if (!window || !Array.isArray(window.slots)) return ''
   const limit = Math.min(window.slots.length, 54)
@@ -562,6 +600,1204 @@ function getItemLoreText (item) {
     .filter((line) => line)
 }
 
+function waitForWindowOpen (timeoutMs = ordersOpenTimeoutMs) {
+  return new Promise((resolve) => {
+    let settled = false
+    let timer = null
+
+    const onOpen = (window) => {
+      if (settled) return
+      settled = true
+      if (timer) clearTimeout(timer)
+      bot.removeListener('windowOpen', onOpen)
+      resolve(window || null)
+    }
+
+    bot.on('windowOpen', onOpen)
+
+    const timeout = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 0
+    if (timeout > 0) {
+      timer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        bot.removeListener('windowOpen', onOpen)
+        resolve(null)
+      }, timeout)
+    }
+  })
+}
+
+function logWindowContainerSlots (window, options = {}) {
+  if (!window || !Array.isArray(window.slots)) {
+    console.log('[SpawnProbe] No window to inspect.')
+    return
+  }
+
+  const includeLore = Boolean(options.includeLore)
+  const label = options.label ? String(options.label) : 'Window'
+  const containerSlots = getContainerSlotCount(window)
+  let nonEmpty = 0
+  let empty = 0
+
+  console.log(`[SpawnProbe] ${label}: type=${window.type || 'unknown'} containerSlots=${containerSlots}`)
+  for (let i = 0; i < containerSlots; i += 1) {
+    const item = window.slots[i]
+    if (!item) {
+      empty += 1
+      continue
+    }
+
+    nonEmpty += 1
+    const name = item.name || 'unknown'
+    const display = getSlotLabel(item) || item.displayName || item.customName || 'unknown'
+    const count = item.count ?? 1
+    console.log(`[SpawnProbe] slot ${i}: ${name} (${display}) x${count}`)
+
+    if (includeLore) {
+      const lore = getItemLoreText(item)
+      if (lore.length > 0) {
+        console.log(`[SpawnProbe]   lore: ${lore.join(' | ')}`)
+      }
+    }
+  }
+
+  console.log(`[SpawnProbe] Non-empty: ${nonEmpty}/${containerSlots} | Empty: ${empty}`)
+}
+
+function findYourOrdersChestSlot (window) {
+  if (!window || !Array.isArray(window.slots)) return -1
+  const containerSlots = getContainerSlotCount(window)
+  for (let i = 0; i < containerSlots; i += 1) {
+    const item = window.slots[i]
+    if (!item) continue
+    const itemName = String(item.name || '').toLowerCase()
+    if (!itemName.includes('chest')) continue
+    const lore = getItemLoreText(item)
+    if (lore.some((line) => String(line).toUpperCase().includes('YOUR ORDERS'))) {
+      return i
+    }
+  }
+  return -1
+}
+
+async function runSpawnOrdersProbe () {
+  if (!enableOrders) return
+  if (ordersInFlight || currentTask || searchAllRunning || searchAllRequested) {
+    console.log('[SpawnProbe] Skipping probe because orders queue is busy.')
+    return
+  }
+
+  if (bot.currentWindow) {
+    closeOrdersWindow(bot.currentWindow)
+    await delay(400)
+  }
+
+  const command = `${ordersCommandPrefix}`.trim()
+  console.log(`[SpawnProbe] Step 1/4: Sending command ${command}`)
+  bot.chat(command)
+
+  const openedWindow = await waitForWindowOpen(ordersOpenTimeoutMs)
+  if (!openedWindow) {
+    console.warn('[SpawnProbe] Orders window did not open in time.')
+    return
+  }
+
+  await delay(300)
+  let activeWindow = bot.currentWindow || openedWindow
+
+  console.log('[SpawnProbe] Step 2/4: Inspecting container slots (excluding player inventory).')
+  logWindowContainerSlots(activeWindow, { label: 'Orders root', includeLore: false })
+
+  console.log('[SpawnProbe] Step 3/4: Searching Chest with lore "YOUR ORDERS".')
+  const targetSlot = findYourOrdersChestSlot(activeWindow)
+  if (targetSlot < 0) {
+    console.warn('[SpawnProbe] Could not find "YOUR ORDERS" chest in current GUI.')
+    return
+  }
+
+  const signatureBeforeClick = windowSignature(activeWindow)
+  if (!clickWindowSlot(targetSlot)) {
+    console.warn(`[SpawnProbe] Failed to click target slot ${targetSlot}.`)
+    return
+  }
+
+  const changed = await waitForWindowChange(
+    () => bot.currentWindow || activeWindow,
+    signatureBeforeClick,
+    8000
+  )
+  if (!changed) {
+    console.warn('[SpawnProbe] GUI did not change after clicking "YOUR ORDERS".')
+  }
+
+  await delay(300)
+  activeWindow = bot.currentWindow || activeWindow
+
+  console.log('[SpawnProbe] Step 4/4: Inspecting new GUI with lore lines.')
+  logWindowContainerSlots(activeWindow, { label: 'Your Orders', includeLore: true })
+}
+
+// Grupo de tarea: estado/modelo trader + seleccion de candidatos rentables.
+function parseCompactToken (value) {
+  if (value == null) return null
+  const normalized = String(value).trim().replace(/,/g, '')
+  if (!normalized) return null
+  const parsed = parseCompactNumber(normalized.toUpperCase())
+  if (!Number.isFinite(parsed)) return null
+  return parsed
+}
+
+function parsePriceFromLoreLine (line) {
+  const text = String(line || '')
+  const match = text.match(/\$([\d.,]+(?:[KMB])?)/i)
+  if (!match) return null
+  return parseCompactToken(match[1])
+}
+
+function normalizeEnchantmentEntry (entry) {
+  if (!entry || typeof entry !== 'object') return null
+  const name = String(entry.name || '').trim().toLowerCase()
+  if (!name) return null
+  const levelRaw = Number(entry.level)
+  const level = Number.isFinite(levelRaw) && levelRaw > 0 ? Math.floor(levelRaw) : 1
+  return { name, level }
+}
+
+function normalizeEnchantments (enchantments) {
+  if (!Array.isArray(enchantments) || enchantments.length === 0) return []
+  const dedup = new Map()
+  for (const raw of enchantments) {
+    const normalized = normalizeEnchantmentEntry(raw)
+    if (!normalized) continue
+    const key = `${normalized.name}:${normalized.level}`
+    dedup.set(key, normalized)
+  }
+  const list = [...dedup.values()]
+  list.sort((a, b) => {
+    if (a.name !== b.name) return a.name.localeCompare(b.name)
+    return a.level - b.level
+  })
+  return list
+}
+
+function getEnchantmentsKey (enchantments) {
+  const normalized = normalizeEnchantments(enchantments)
+  if (!normalized.length) return ''
+  return normalized.map((entry) => `${entry.name}:${entry.level}`).join('|')
+}
+
+function buildProductIdentity (name, enchantments) {
+  const base = normalizeProductKey(name || '')
+  if (!base) return ''
+  const enchantmentsKey = getEnchantmentsKey(enchantments)
+  if (!enchantmentsKey) return base
+  return `${base}::${enchantmentsKey}`
+}
+
+function buildMarketOrderKey (order) {
+  if (!order) return ''
+  const productId = buildProductIdentity(order.name, order.enchantments)
+  if (!productId) return ''
+  const user = String(order.userName || '').trim().toLowerCase()
+  const price = Number.isFinite(order.price) ? order.price : 0
+  const ordered = Number.isFinite(order.amountOrdered) ? Math.floor(order.amountOrdered) : 0
+  const expiresAt = Number.isFinite(order.expiresAt) ? Math.floor(order.expiresAt) : 0
+  return `${productId}|${user}|${price}|${ordered}|${expiresAt}`
+}
+
+function getOrderRemaining (order) {
+  if (!order) return 0
+  const ordered = Number.isFinite(order.amountOrdered) ? order.amountOrdered : 0
+  const delivered = Number.isFinite(order.amountDelivered) ? order.amountDelivered : 0
+  return Math.max(ordered - delivered, 0)
+}
+
+function normalizeOwnedEntry (entry) {
+  if (!entry || typeof entry !== 'object') return null
+  const name = stripFormatting(entry.name || entry.productName || '').trim()
+  const displayName = stripFormatting(entry.displayName || name).trim()
+  const unitPriceRaw = Number(entry.unitPrice ?? entry.boughtUnitPrice ?? entry.price)
+  const unitPrice = Number.isFinite(unitPriceRaw) ? unitPriceRaw : null
+  if (!displayName || !Number.isFinite(unitPrice) || unitPrice <= 0) return null
+
+  const amountBoughtRaw = Number(entry.amountBought ?? entry.amountOrdered ?? entry.totalAmount)
+  const amountBought = Number.isFinite(amountBoughtRaw) ? Math.max(Math.floor(amountBoughtRaw), 0) : 0
+  const amountReadyRaw = Number(entry.amountReady ?? entry.amountDelivered ?? entry.availableAmount)
+  const amountReady = Number.isFinite(amountReadyRaw) ? Math.max(Math.floor(amountReadyRaw), 0) : null
+  const enchantments = normalizeEnchantments(entry.enchantments)
+  const enchantmentsKey = getEnchantmentsKey(enchantments)
+  const productKey = normalizeProductKey(entry.productKey || displayName)
+  const productId = buildProductIdentity(displayName, enchantments)
+  if (!productId) return null
+
+  const slotRaw = Number(entry.slot)
+  const slot = Number.isInteger(slotRaw) && slotRaw >= 0 ? slotRaw : null
+
+  return {
+    productId,
+    productKey: productKey || normalizeProductKey(displayName),
+    name: displayName,
+    enchantments,
+    enchantmentsKey,
+    unitPrice,
+    amountBought,
+    amountReady,
+    slot,
+    updatedAt: Date.now()
+  }
+}
+
+function rebuildTraderOwnedByProduct () {
+  traderOwnedByProduct = new Map()
+  for (const owned of traderOwnedOrders) {
+    const key = owned.productId
+    if (!key) continue
+    const arr = traderOwnedByProduct.get(key) || []
+    arr.push(owned)
+    traderOwnedByProduct.set(key, arr)
+  }
+  for (const arr of traderOwnedByProduct.values()) {
+    arr.sort((a, b) => {
+      const priceDiff = (a.unitPrice || 0) - (b.unitPrice || 0)
+      if (priceDiff !== 0) return priceDiff
+      return (b.amountReady || 0) - (a.amountReady || 0)
+    })
+  }
+}
+
+function saveTraderOwnedState () {
+  try {
+    const payload = {
+      updatedAt: new Date().toISOString(),
+      entries: traderOwnedOrders
+    }
+    fs.writeFileSync(ordersOwnedPath, JSON.stringify(payload, null, 2), 'utf8')
+  } catch (err) {
+    console.warn('Failed to save owned orders:', err && err.message ? err.message : err)
+  }
+}
+
+function saveTraderMarketState () {
+  try {
+    const payload = {
+      updatedAt: new Date().toISOString(),
+      entries: [...traderMarketState.values()]
+    }
+    fs.writeFileSync(ordersMarketStatePath, JSON.stringify(payload, null, 2), 'utf8')
+  } catch (err) {
+    console.warn('Failed to save trader market state:', err && err.message ? err.message : err)
+  }
+}
+
+function normalizeMarketStateEntry (entry) {
+  if (!entry || typeof entry !== 'object') return null
+  const key = String(entry.key || '').trim()
+  if (!key) return null
+  const productId = String(entry.productId || '').trim()
+  if (!productId) return null
+  const productKey = normalizeProductKey(entry.productKey || productId.split('::')[0] || '')
+  const name = stripFormatting(entry.name || '').trim()
+  const userName = stripFormatting(entry.userName || '').trim()
+  const price = Number(entry.price)
+  const amountOrdered = Number(entry.amountOrdered)
+  const amountDelivered = Number(entry.amountDelivered)
+  const amountRemaining = Number(entry.amountRemaining)
+  const expiresAt = Number(entry.expiresAt)
+  const seenCount = Number(entry.seenCount)
+  const firstSeenAt = Number(entry.firstSeenAt)
+  const lastSeenAt = Number(entry.lastSeenAt)
+  const enchantments = normalizeEnchantments(entry.enchantments)
+  return {
+    key,
+    productId,
+    productKey,
+    name,
+    enchantments,
+    enchantmentsKey: getEnchantmentsKey(enchantments),
+    userName,
+    price: Number.isFinite(price) ? price : 0,
+    amountOrdered: Number.isFinite(amountOrdered) ? amountOrdered : 0,
+    amountDelivered: Number.isFinite(amountDelivered) ? amountDelivered : 0,
+    amountRemaining: Number.isFinite(amountRemaining) ? amountRemaining : 0,
+    expiresAt: Number.isFinite(expiresAt) ? expiresAt : 0,
+    seenCount: Number.isFinite(seenCount) && seenCount > 0 ? Math.floor(seenCount) : 1,
+    firstSeenAt: Number.isFinite(firstSeenAt) ? firstSeenAt : Date.now(),
+    lastSeenAt: Number.isFinite(lastSeenAt) ? lastSeenAt : Date.now()
+  }
+}
+
+function loadTraderOwnedState () {
+  try {
+    if (!fs.existsSync(ordersOwnedPath)) return
+    const raw = fs.readFileSync(ordersOwnedPath, 'utf8')
+    const parsed = JSON.parse(raw)
+    const entries = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.entries) ? parsed.entries : [])
+    const normalized = entries.map(normalizeOwnedEntry).filter(Boolean)
+    traderOwnedOrders = normalized
+    rebuildTraderOwnedByProduct()
+  } catch (err) {
+    console.warn('Failed to load owned orders:', err && err.message ? err.message : err)
+  }
+}
+
+function loadTraderMarketState () {
+  try {
+    if (!fs.existsSync(ordersMarketStatePath)) return
+    const raw = fs.readFileSync(ordersMarketStatePath, 'utf8')
+    const parsed = JSON.parse(raw)
+    const entries = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.entries) ? parsed.entries : [])
+    traderMarketState = new Map()
+    for (const rawEntry of entries) {
+      const normalized = normalizeMarketStateEntry(rawEntry)
+      if (!normalized) continue
+      traderMarketState.set(normalized.key, normalized)
+    }
+  } catch (err) {
+    console.warn('Failed to load trader market state:', err && err.message ? err.message : err)
+  }
+}
+
+function loadTraderState () {
+  loadTraderOwnedState()
+  loadTraderMarketState()
+}
+
+function pruneTraderState (now = Date.now()) {
+  for (const [key, value] of traderMarketState.entries()) {
+    const expiry = Number.isFinite(value.expiresAt) ? value.expiresAt : 0
+    const staleByAge = Number.isFinite(value.lastSeenAt) && now - value.lastSeenAt > 6 * 60 * 60 * 1000
+    const expired = expiry > 0 && now > expiry + 10 * 60 * 1000
+    if (staleByAge || expired) {
+      traderMarketState.delete(key)
+    }
+  }
+
+  for (const [key, until] of traderOrderCooldown.entries()) {
+    if (!Number.isFinite(until) || until <= now) {
+      traderOrderCooldown.delete(key)
+    }
+  }
+}
+
+function logTraderDeal (payload) {
+  if (!payload || typeof payload !== 'object') return
+  const entry = {
+    ts: new Date().toISOString(),
+    ...payload
+  }
+  try {
+    fs.appendFileSync(ordersTraderDealsPath, JSON.stringify(entry) + '\n', 'utf8')
+  } catch (err) {
+    console.warn('Failed to write trader deal log:', err && err.message ? err.message : err)
+  }
+}
+
+function findRefreshControlSlot (window) {
+  if (!window || !Array.isArray(window.slots)) return -1
+  const containerSlots = getContainerSlotCount(window)
+  for (let i = 0; i < containerSlots; i += 1) {
+    const item = window.slots[i]
+    if (!item) continue
+    const name = String(item.name || '').toLowerCase()
+    if (!name.includes('map')) continue
+    const lore = getItemLoreText(item).map((line) => line.toLowerCase())
+    if (lore.some((line) => line.includes('refresh'))) {
+      return i
+    }
+  }
+  return -1
+}
+
+function findConfirmControlSlot (window) {
+  if (!window || !Array.isArray(window.slots)) return -1
+  const containerSlots = getContainerSlotCount(window)
+  for (let i = 0; i < containerSlots; i += 1) {
+    const item = window.slots[i]
+    if (!item) continue
+    const lore = getItemLoreText(item).map((line) => line.toUpperCase())
+    const label = getSlotLabel(item).toUpperCase()
+    if (label.includes('CONFIRM')) return i
+    if (lore.some((line) => line.includes('CONFIRM'))) return i
+  }
+  return -1
+}
+
+function resolveYourOrdersChestSlot (window) {
+  if (!window || !Array.isArray(window.slots)) return -1
+  const containerSlots = getContainerSlotCount(window)
+  if (
+    Number.isInteger(traderYourOrdersChestSlot) &&
+    traderYourOrdersChestSlot >= 0 &&
+    traderYourOrdersChestSlot < containerSlots
+  ) {
+    const cached = window.slots[traderYourOrdersChestSlot]
+    const lore = getItemLoreText(cached)
+    const isChest = String(cached?.name || '').toLowerCase().includes('chest')
+    if (isChest && lore.some((line) => String(line).toUpperCase().includes('YOUR ORDERS'))) {
+      return traderYourOrdersChestSlot
+    }
+  }
+  const found = findYourOrdersChestSlot(window)
+  if (found >= 0) {
+    traderYourOrdersChestSlot = found
+  }
+  return found
+}
+
+function resolveRefreshSlot (window) {
+  if (!window || !Array.isArray(window.slots)) return -1
+  const containerSlots = getContainerSlotCount(window)
+  if (
+    Number.isInteger(traderRefreshSlot) &&
+    traderRefreshSlot >= 0 &&
+    traderRefreshSlot < containerSlots
+  ) {
+    const cached = window.slots[traderRefreshSlot]
+    const lore = getItemLoreText(cached).map((line) => line.toLowerCase())
+    const isMap = String(cached?.name || '').toLowerCase().includes('map')
+    if (isMap && lore.some((line) => line.includes('refresh'))) {
+      return traderRefreshSlot
+    }
+  }
+  const found = findRefreshControlSlot(window)
+  if (found >= 0) {
+    traderRefreshSlot = found
+  }
+  return found
+}
+
+function parseOwnedOrderFromItem (item, slot) {
+  if (!item) return null
+  const lore = getItemLoreText(item)
+  if (!lore.length) return null
+
+  const lowerLore = lore.map((line) => line.toLowerCase())
+  if (lowerLore.some((line) => line.includes('click to view your orders'))) return null
+  if (lowerLore.some((line) => line.includes('click to go back'))) return null
+
+  const priceLine = lore.find((line) => /\$[\d]/.test(line))
+  const unitPrice = parsePriceFromLoreLine(priceLine)
+  if (!Number.isFinite(unitPrice) || unitPrice <= 0) return null
+
+  let amountReady = null
+  let amountBought = 0
+  const pairLine = lore.find((line) => /^\s*[\d.,KMB]+\s*\/\s*[\d.,KMB]+(?:\s|$)/i.test(line))
+  if (pairLine) {
+    const match = pairLine.match(/^\s*([\d.,KMB]+)\s*\/\s*([\d.,KMB]+)(?:\s|$)/i)
+    if (match) {
+      const left = parseCompactToken(match[1])
+      const right = parseCompactToken(match[2])
+      if (Number.isFinite(left)) amountReady = Math.max(Math.floor(left), 0)
+      if (Number.isFinite(right)) amountBought = Math.max(Math.floor(right), 0)
+    }
+  }
+
+  if (amountBought <= 0) {
+    const qtyLine = lore.find((line) => /^\s*[\d.,KMB]+\s+.+$/.test(line))
+    const qtyMatch = qtyLine ? qtyLine.match(/^\s*([\d.,KMB]+)\s+.+$/) : null
+    const qty = qtyMatch ? parseCompactToken(qtyMatch[1]) : null
+    if (Number.isFinite(qty)) amountBought = Math.max(Math.floor(qty), 0)
+  }
+
+  const displayName = stripFormatting(item.displayName || item.customName || item.name || '').trim()
+  if (!displayName) return null
+
+  const priceIndex = priceLine ? lore.findIndex((line) => line === priceLine) : lore.length
+  const enchantCandidates = []
+  for (let i = 0; i < lore.length; i += 1) {
+    if (i >= priceIndex) break
+    const line = lore[i]
+    const cleaned = stripFormatting(line).trim()
+    if (!cleaned) continue
+    if (/^\$[\d]/.test(cleaned)) continue
+    if (/^\s*[\d.,KMB]+\s*\/\s*[\d.,KMB]+/i.test(cleaned)) continue
+    if (/^\s*[\d.,KMB]+\s+/.test(cleaned)) continue
+    if (cleaned.toLowerCase().includes('click to')) continue
+    if (cleaned.toLowerCase() === displayName.toLowerCase()) continue
+    enchantCandidates.push(cleaned)
+  }
+
+  const enchantments = normalizeEnchantments(mapEnchantmentsLegacy(enchantCandidates))
+  const productId = buildProductIdentity(displayName, enchantments)
+  if (!productId) return null
+
+  return {
+    productId,
+    productKey: normalizeProductKey(displayName),
+    name: displayName,
+    enchantments,
+    enchantmentsKey: getEnchantmentsKey(enchantments),
+    unitPrice,
+    amountBought,
+    amountReady,
+    slot: Number.isInteger(slot) ? slot : null,
+    updatedAt: Date.now()
+  }
+}
+
+function collectOwnedOrdersFromWindow (window) {
+  if (!window || !Array.isArray(window.slots)) return []
+  const containerSlots = getContainerSlotCount(window)
+  const entries = []
+  for (let i = 0; i < containerSlots; i += 1) {
+    const parsed = parseOwnedOrderFromItem(window.slots[i], i)
+    if (!parsed) continue
+    entries.push(parsed)
+  }
+  return entries
+}
+
+async function openOrdersWindowForTrader () {
+  if (bot.currentWindow) {
+    closeOrdersWindow(bot.currentWindow)
+    await delay(300)
+  }
+
+  const command = `${ordersCommandPrefix}`.trim()
+  bot.chat(command)
+  const openedWindow = await waitForWindowOpen(ordersOpenTimeoutMs)
+  if (!openedWindow) return null
+  await delay(250)
+  return bot.currentWindow || openedWindow
+}
+
+async function clickSlotAndWaitForWindow (window, slot, timeoutMs = ordersOpenTimeoutMs) {
+  if (!window || !Number.isInteger(slot) || slot < 0) return null
+  const beforeSignature = windowSignature(window)
+  if (!clickWindowSlot(slot)) return null
+  await waitForWindowChange(
+    () => bot.currentWindow || window,
+    beforeSignature,
+    timeoutMs
+  )
+  await delay(250)
+  return bot.currentWindow || window
+}
+
+function extractMarketOrdersFromWindow (window) {
+  if (!window || !Array.isArray(window.slots)) return []
+  const containerSlots = getContainerSlotCount(window)
+  const orders = []
+  for (let i = 0; i < containerSlots; i += 1) {
+    const item = window.slots[i]
+    if (!item) continue
+    const parsed = parseOrderFromItem(item)
+    if (!parsed || !parsed.order) continue
+    const order = parsed.order
+    const productId = buildProductIdentity(order.name, order.enchantments)
+    if (!productId) continue
+    const marketKey = buildMarketOrderKey(order)
+    if (!marketKey) continue
+    orders.push({
+      key: marketKey,
+      productId,
+      slot: i,
+      order,
+      amountRemaining: getOrderRemaining(order)
+    })
+  }
+  return orders
+}
+
+function updateTraderMarketState (orders) {
+  if (!Array.isArray(orders) || orders.length === 0) return false
+  const now = Date.now()
+  let changed = false
+
+  for (const market of orders) {
+    const key = market.key
+    if (!key) continue
+    const current = traderMarketState.get(key)
+    if (!current) {
+      traderMarketState.set(key, {
+        key,
+        productId: market.productId,
+        productKey: normalizeProductKey(market.order?.name || ''),
+        name: market.order?.name || '',
+        enchantments: normalizeEnchantments(market.order?.enchantments || []),
+        enchantmentsKey: getEnchantmentsKey(market.order?.enchantments || []),
+        userName: market.order?.userName || '',
+        price: Number.isFinite(market.order?.price) ? market.order.price : 0,
+        amountOrdered: Number.isFinite(market.order?.amountOrdered) ? market.order.amountOrdered : 0,
+        amountDelivered: Number.isFinite(market.order?.amountDelivered) ? market.order.amountDelivered : 0,
+        amountRemaining: Number.isFinite(market.amountRemaining) ? market.amountRemaining : 0,
+        expiresAt: Number.isFinite(market.order?.expiresAt) ? market.order.expiresAt : 0,
+        seenCount: 1,
+        firstSeenAt: now,
+        lastSeenAt: now
+      })
+      changed = true
+      continue
+    }
+
+    const nextDelivered = Number.isFinite(market.order?.amountDelivered) ? market.order.amountDelivered : current.amountDelivered
+    const nextRemaining = Number.isFinite(market.amountRemaining) ? market.amountRemaining : current.amountRemaining
+    const nextSeenCount = (current.seenCount || 0) + 1
+    if (
+      current.amountDelivered !== nextDelivered ||
+      current.amountRemaining !== nextRemaining ||
+      current.seenCount !== nextSeenCount ||
+      current.lastSeenAt !== now
+    ) {
+      current.amountDelivered = nextDelivered
+      current.amountRemaining = nextRemaining
+      current.seenCount = nextSeenCount
+      current.lastSeenAt = now
+      changed = true
+    }
+  }
+
+  pruneTraderState(now)
+  if (changed) {
+    saveTraderMarketState()
+  }
+  return changed
+}
+
+function pickBestTraderCandidate (orders) {
+  if (!Array.isArray(orders) || orders.length === 0) return null
+  const now = Date.now()
+  pruneTraderState(now)
+  const myUser = String(bot.username || '').trim().toLowerCase()
+  let best = null
+
+  for (const market of orders) {
+    if (!market || !market.order || !market.productId) continue
+    if (market.amountRemaining <= 0) continue
+
+    const marketUser = String(market.order.userName || '').trim().toLowerCase()
+    if (myUser && marketUser === myUser) continue
+
+    const cooldownUntil = traderOrderCooldown.get(market.key)
+    if (Number.isFinite(cooldownUntil) && cooldownUntil > now) continue
+
+    const ownedList = traderOwnedByProduct.get(market.productId)
+    if (!ownedList || ownedList.length === 0) continue
+
+    for (const owned of ownedList) {
+      const buyPrice = Number(owned.unitPrice)
+      const sellPrice = Number(market.order.price)
+      if (!Number.isFinite(buyPrice) || buyPrice <= 0) continue
+      if (!Number.isFinite(sellPrice) || sellPrice <= 0) continue
+
+      const minSellPrice = buyPrice * (1 + ordersTraderMarginPct)
+      if (sellPrice < minSellPrice) continue
+
+      const marginAbsolute = sellPrice - buyPrice
+      const marginPercent = marginAbsolute / buyPrice
+      const ownedReadyRaw = Number.isFinite(owned.amountReady) ? owned.amountReady : owned.amountBought
+      const ownedReady = Number.isFinite(ownedReadyRaw) ? Math.max(Math.floor(ownedReadyRaw), 0) : 0
+      const sellableAmount = ownedReady > 0
+        ? Math.min(ownedReady, market.amountRemaining)
+        : market.amountRemaining
+      const score = marginAbsolute * Math.max(sellableAmount, 1)
+
+      const candidate = {
+        marketKey: market.key,
+        productId: market.productId,
+        marketSlot: market.slot,
+        marketOrder: market.order,
+        ownedRef: owned,
+        buyPrice,
+        sellPrice,
+        marginAbsolute,
+        marginPercent,
+        minSellPrice,
+        sellableAmount,
+        score
+      }
+
+      if (!best || candidate.score > best.score) {
+        best = candidate
+      }
+    }
+  }
+
+  return best
+}
+
+function setTraderCooldown (key, ttlMs) {
+  if (!key) return
+  const ttl = Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : 30_000
+  traderOrderCooldown.set(key, Date.now() + ttl)
+}
+
+function getTraderRefreshDelayMs () {
+  const min = Math.max(100, Math.floor(Number.isFinite(ordersTraderRefreshMinMs) ? ordersTraderRefreshMinMs : 500))
+  const maxRaw = Math.floor(Number.isFinite(ordersTraderRefreshMaxMs) ? ordersTraderRefreshMaxMs : 5490)
+  const max = Math.max(min + 1, maxRaw)
+  return randomBetween(min, max + 1)
+}
+
+function getLooseProductKey (value) {
+  let key = normalizeProductKey(value || '')
+  if (!key) return ''
+  key = key.replace(/_+/g, '_')
+  if (key.endsWith('ies')) {
+    key = `${key.slice(0, -3)}y`
+  } else if (/(ches|shes|xes|zes|ses)$/.test(key)) {
+    key = key.slice(0, -2)
+  } else if (key.endsWith('s') && !key.endsWith('ss')) {
+    key = key.slice(0, -1)
+  }
+  return key
+}
+
+function productKeyMatchesLoose (left, right) {
+  const a = getLooseProductKey(left)
+  const b = getLooseProductKey(right)
+  if (!a || !b) return false
+  if (a === b) return true
+  if (a.includes(b) || b.includes(a)) return true
+  return false
+}
+
+function getItemProductKey (item) {
+  if (!item) return ''
+  const label = getSlotLabel(item) || item.displayName || item.customName || item.name || ''
+  return normalizeProductKey(label)
+}
+
+function updateOwnedOrdersState (entries) {
+  const normalized = Array.isArray(entries)
+    ? entries.map(normalizeOwnedEntry).filter(Boolean)
+    : []
+  traderOwnedOrders = normalized
+  rebuildTraderOwnedByProduct()
+  traderLastOwnedSyncAt = Date.now()
+  saveTraderOwnedState()
+  return traderOwnedOrders.length
+}
+
+async function syncOwnedOrdersFromGui () {
+  const rootWindow = await openOrdersWindowForTrader()
+  if (!rootWindow) {
+    console.warn('[Trader] Failed to open /orders for owned sync.')
+    return false
+  }
+
+  const yourOrdersSlot = resolveYourOrdersChestSlot(rootWindow)
+  if (yourOrdersSlot < 0) {
+    console.warn('[Trader] Could not find YOUR ORDERS chest while syncing owned orders.')
+    closeOrdersWindow(bot.currentWindow || rootWindow)
+    await delay(250)
+    return false
+  }
+
+  const yourOrdersWindow = await clickSlotAndWaitForWindow(rootWindow, yourOrdersSlot, ordersOpenTimeoutMs)
+  if (!yourOrdersWindow) {
+    console.warn('[Trader] Failed to open YOUR ORDERS GUI.')
+    closeOrdersWindow(bot.currentWindow || rootWindow)
+    await delay(250)
+    return false
+  }
+
+  const ownedEntries = collectOwnedOrdersFromWindow(yourOrdersWindow)
+  const count = updateOwnedOrdersState(ownedEntries)
+  console.log(`[Trader] Owned orders synced: ${count}`)
+
+  closeOrdersWindow(bot.currentWindow || yourOrdersWindow)
+  await delay(250)
+  return true
+}
+
+function findBestOwnedSlotForCandidate (window, candidate) {
+  if (!window || !candidate?.productId) return -1
+  const entries = collectOwnedOrdersFromWindow(window)
+  const sellPrice = Number(candidate.sellPrice)
+  const candidateEnchantKey = getEnchantmentsKey(candidate.marketOrder?.enchantments || [])
+  const eligible = entries.filter((entry) => {
+    if (!entry?.productId) return false
+    const exactProduct = entry.productId === candidate.productId
+    const looseProduct = productKeyMatchesLoose(entry.productKey, candidate.marketOrder?.name || '')
+    const sameProduct = exactProduct || looseProduct
+    if (!sameProduct) return false
+    if (candidateEnchantKey && !exactProduct) return false
+    const buyPrice = Number(entry.unitPrice)
+    if (!Number.isFinite(buyPrice) || buyPrice <= 0) return false
+    return sellPrice >= buyPrice * (1 + ordersTraderMarginPct)
+  })
+  if (eligible.length === 0) return -1
+  eligible.sort((a, b) => {
+    const diff = (a.unitPrice || 0) - (b.unitPrice || 0)
+    if (diff !== 0) return diff
+    return (b.amountReady || 0) - (a.amountReady || 0)
+  })
+  return Number.isInteger(eligible[0]?.slot) ? eligible[0].slot : -1
+}
+
+function isLikelyControlItem (item) {
+  if (!item) return true
+  const name = String(item.name || '').toLowerCase()
+  if (!name) return false
+  if (name.includes('glass_pane')) return true
+  if (name.includes('barrier')) return true
+  if (name === 'arrow') return true
+  if (name === 'cauldron') return true
+  if (name === 'map') return true
+  if (name === 'oak_sign') return true
+  if (name === 'hopper') return true
+  if (name === 'chest') return true
+  return false
+}
+
+function findOwnedClaimItemSlot (window, productId) {
+  if (!window || !Array.isArray(window.slots)) return -1
+  const targetKey = productId ? productId.split('::')[0] : ''
+  const containerSlots = getContainerSlotCount(window)
+  let best = { slot: -1, score: -1 }
+
+  for (let i = 0; i < containerSlots; i += 1) {
+    const item = window.slots[i]
+    if (!item) continue
+    const itemKey = getItemProductKey(item)
+    const controlPenalty = isLikelyControlItem(item) ? -40 : 0
+    const matchBonus = targetKey && productKeyMatchesLoose(itemKey, targetKey) ? 100 : 0
+    const countBonus = Number.isFinite(item.count) ? Math.min(item.count, 64) : 1
+    const score = matchBonus + countBonus + controlPenalty
+    if (score > best.score) {
+      best = { slot: i, score }
+    }
+  }
+
+  return best.slot
+}
+
+function findFirstEmptyInventorySlotInWindow (window) {
+  if (!window || !Array.isArray(window.slots)) return -1
+  const start = getContainerSlotCount(window)
+  const end = Math.min(window.slots.length, start + 36)
+  for (let i = start; i < end; i += 1) {
+    if (!window.slots[i]) return i
+  }
+  return -1
+}
+
+async function moveOwnedItemToInventory (window, productId) {
+  let activeWindow = bot.currentWindow || window
+  const sourceSlot = findOwnedClaimItemSlot(activeWindow, productId)
+  if (sourceSlot < 0) {
+    console.warn('[Trader] Could not find a source slot to claim item from YOUR ORDERS detail.')
+    return false
+  }
+
+  if (clickWindowSlotMode(sourceSlot, 0, 1)) {
+    await delay(350)
+    activeWindow = bot.currentWindow || activeWindow
+    if (!activeWindow.slots[sourceSlot]) {
+      return true
+    }
+  }
+
+  activeWindow = bot.currentWindow || activeWindow
+  const inventorySlot = findFirstEmptyInventorySlotInWindow(activeWindow)
+  if (inventorySlot < 0) {
+    console.warn('[Trader] No free inventory slot available to pull claimed order item.')
+    return false
+  }
+
+  if (!clickWindowSlot(sourceSlot)) return false
+  await delay(150)
+  if (!clickWindowSlot(inventorySlot)) return false
+  await delay(250)
+  return true
+}
+
+function findInventorySlotForProduct (window, productId) {
+  if (!window || !Array.isArray(window.slots)) return -1
+  const targetKey = productId ? productId.split('::')[0] : ''
+  if (!targetKey) return -1
+  const start = getContainerSlotCount(window)
+  const end = Math.min(window.slots.length, start + 36)
+  let fallback = -1
+
+  for (let i = start; i < end; i += 1) {
+    const item = window.slots[i]
+    if (!item) continue
+    const key = getItemProductKey(item)
+    if (!key) continue
+    if (key === targetKey) return i
+    if (productKeyMatchesLoose(key, targetKey) && fallback < 0) {
+      fallback = i
+    }
+  }
+
+  return fallback
+}
+
+async function moveInventoryItemToDeliveryWindow (window, productId) {
+  const activeWindow = bot.currentWindow || window
+  const inventorySlot = findInventorySlotForProduct(activeWindow, productId)
+  if (inventorySlot < 0) {
+    console.warn('[Trader] Could not find matching inventory item to deliver.')
+    return false
+  }
+
+  if (!clickWindowSlotMode(inventorySlot, 0, 1)) return false
+  await delay(350)
+  return true
+}
+
+function findMarketSlotForCandidate (window, candidate) {
+  if (!window || !candidate) return -1
+  const orders = extractMarketOrdersFromWindow(window)
+  const exact = orders.find((entry) => entry.key === candidate.marketKey)
+  if (exact) return exact.slot
+
+  const fallback = orders.find((entry) => {
+    if (entry.productId !== candidate.productId) return false
+    if (!entry.order || !candidate.marketOrder) return false
+    const userA = String(entry.order.userName || '').trim().toLowerCase()
+    const userB = String(candidate.marketOrder.userName || '').trim().toLowerCase()
+    if (userA !== userB) return false
+    return Number(entry.order.price) === Number(candidate.marketOrder.price)
+  })
+  return fallback ? fallback.slot : -1
+}
+
+async function executeTraderCandidate (rootWindow, candidate) {
+  if (!rootWindow || !candidate) return false
+  console.log(
+    `[Trader] Opportunity: ${candidate.marketOrder?.name || candidate.productId} ` +
+    `buy ${formatPriceCompact(candidate.buyPrice)} -> sell ${formatPriceCompact(candidate.sellPrice)} ` +
+    `(${(candidate.marginPercent * 100).toFixed(1)}%)`
+  )
+
+  let activeWindow = rootWindow
+  const yourOrdersSlot = resolveYourOrdersChestSlot(activeWindow)
+  if (yourOrdersSlot < 0) {
+    console.warn('[Trader] Could not find YOUR ORDERS chest before execution.')
+    setTraderCooldown(candidate.marketKey, 15_000)
+    return false
+  }
+
+  let yourOrdersWindow = await clickSlotAndWaitForWindow(activeWindow, yourOrdersSlot, ordersOpenTimeoutMs)
+  if (!yourOrdersWindow) {
+    console.warn('[Trader] Failed opening YOUR ORDERS while executing candidate.')
+    setTraderCooldown(candidate.marketKey, 15_000)
+    return false
+  }
+
+  const ownedSlot = findBestOwnedSlotForCandidate(yourOrdersWindow, candidate)
+  if (ownedSlot < 0) {
+    console.warn('[Trader] Matching owned order not found for profitable candidate.')
+    setTraderCooldown(candidate.marketKey, 30_000)
+    closeOrdersWindow(bot.currentWindow || yourOrdersWindow)
+    await delay(250)
+    return false
+  }
+
+  const detailWindow = await clickSlotAndWaitForWindow(yourOrdersWindow, ownedSlot, ordersOpenTimeoutMs)
+  if (!detailWindow) {
+    console.warn('[Trader] Failed opening claim window from YOUR ORDERS.')
+    setTraderCooldown(candidate.marketKey, 20_000)
+    closeOrdersWindow(bot.currentWindow || yourOrdersWindow)
+    await delay(250)
+    return false
+  }
+
+  const movedToInventory = await moveOwnedItemToInventory(detailWindow, candidate.productId)
+  if (!movedToInventory) {
+    setTraderCooldown(candidate.marketKey, 20_000)
+    closeOrdersWindow(bot.currentWindow || detailWindow)
+    await delay(250)
+    return false
+  }
+
+  closeOrdersWindow(bot.currentWindow || detailWindow)
+  await delay(250)
+
+  let marketWindow = await openOrdersWindowForTrader()
+  if (!marketWindow) {
+    console.warn('[Trader] Failed reopening /orders for delivery.')
+    setTraderCooldown(candidate.marketKey, 20_000)
+    return false
+  }
+
+  const sortResult = await ensureSortOption(marketWindow, 'recently_listed')
+  marketWindow = sortResult.window || marketWindow
+
+  const marketSlot = findMarketSlotForCandidate(marketWindow, candidate)
+  if (marketSlot < 0) {
+    console.warn('[Trader] Candidate order is no longer visible in market list.')
+    setTraderCooldown(candidate.marketKey, 20_000)
+    closeOrdersWindow(bot.currentWindow || marketWindow)
+    await delay(250)
+    return false
+  }
+
+  const deliveryWindow = await clickSlotAndWaitForWindow(marketWindow, marketSlot, ordersOpenTimeoutMs)
+  if (!deliveryWindow) {
+    console.warn('[Trader] Could not open delivery GUI for candidate order.')
+    setTraderCooldown(candidate.marketKey, 20_000)
+    closeOrdersWindow(bot.currentWindow || marketWindow)
+    await delay(250)
+    return false
+  }
+
+  const movedToDelivery = await moveInventoryItemToDeliveryWindow(deliveryWindow, candidate.productId)
+  if (!movedToDelivery) {
+    setTraderCooldown(candidate.marketKey, 20_000)
+    closeOrdersWindow(bot.currentWindow || deliveryWindow)
+    await delay(250)
+    return false
+  }
+
+  closeOrdersWindow(bot.currentWindow || deliveryWindow)
+
+  const confirmWindow = await waitForWindowOpen(ordersTraderConfirmTimeoutMs)
+  if (!confirmWindow) {
+    console.warn('[Trader] Confirm window did not open after delivery.')
+    setTraderCooldown(candidate.marketKey, 20_000)
+    return false
+  }
+
+  const confirmSlot = findConfirmControlSlot(confirmWindow)
+  if (confirmSlot < 0) {
+    console.warn('[Trader] Confirm button not found in confirmation GUI.')
+    setTraderCooldown(candidate.marketKey, 20_000)
+    closeOrdersWindow(bot.currentWindow || confirmWindow)
+    await delay(250)
+    return false
+  }
+
+  if (!clickWindowSlot(confirmSlot)) {
+    setTraderCooldown(candidate.marketKey, 20_000)
+    closeOrdersWindow(bot.currentWindow || confirmWindow)
+    await delay(250)
+    return false
+  }
+
+  await delay(350)
+  closeOrdersWindow(bot.currentWindow || confirmWindow)
+  await delay(250)
+
+  setTraderCooldown(candidate.marketKey, 45_000)
+  logTraderDeal({
+    action: 'filled',
+    productId: candidate.productId,
+    productName: candidate.marketOrder?.name || candidate.productId,
+    marketUser: candidate.marketOrder?.userName || '',
+    buyPrice: candidate.buyPrice,
+    sellPrice: candidate.sellPrice,
+    marginAbsolute: candidate.marginAbsolute,
+    marginPercent: candidate.marginPercent,
+    sellableAmount: candidate.sellableAmount,
+    marketOrderKey: candidate.marketKey
+  })
+  console.log('[Trader] Deal completed and logged.')
+  return true
+}
+
+function traderCanOperateNow () {
+  if (!enableOrders) return false
+  if (ordersInFlight || currentTask) return false
+  if (searchAllRunning || searchAllRequested) return false
+  return true
+}
+
+async function runTraderMarketCycle () {
+  if (!traderCanOperateNow()) {
+    await delay(500)
+    return
+  }
+
+  let activeWindow = await openOrdersWindowForTrader()
+  if (!activeWindow) {
+    await delay(800)
+    return
+  }
+
+  const sortResult = await ensureSortOption(activeWindow, 'recently_listed')
+  activeWindow = sortResult.window || activeWindow
+
+  resolveYourOrdersChestSlot(activeWindow)
+  const refreshSlot = resolveRefreshSlot(activeWindow)
+  if (refreshSlot < 0) {
+    console.warn('[Trader] Refresh slot not found in /orders GUI.')
+    closeOrdersWindow(bot.currentWindow || activeWindow)
+    await delay(250)
+    return
+  }
+
+  let loops = 0
+  while (traderLoopRunning && traderCanOperateNow()) {
+    const marketOrders = extractMarketOrdersFromWindow(activeWindow)
+    updateTraderMarketState(marketOrders)
+
+    const candidate = pickBestTraderCandidate(marketOrders)
+    if (candidate) {
+      const done = await executeTraderCandidate(activeWindow, candidate)
+      if (done) {
+        await syncOwnedOrdersFromGui()
+      }
+      return
+    }
+
+    const waitMs = getTraderRefreshDelayMs()
+    await delay(waitMs)
+
+    const slot = resolveRefreshSlot(activeWindow)
+    if (slot < 0) break
+
+    const signatureBefore = windowSignature(activeWindow)
+    if (!clickWindowSlot(slot)) break
+    await waitForWindowChange(
+      () => bot.currentWindow || activeWindow,
+      signatureBefore,
+      ordersOpenTimeoutMs
+    )
+    await delay(150)
+    activeWindow = bot.currentWindow || activeWindow
+
+    loops += 1
+    const shouldResyncOwned = Date.now() - traderLastOwnedSyncAt >= ordersTraderOwnedSyncMs
+    if (shouldResyncOwned || loops >= 120) {
+      break
+    }
+  }
+
+  closeOrdersWindow(bot.currentWindow || activeWindow)
+  await delay(250)
+}
+
+async function runTraderLoop () {
+  if (traderLoopRunning) return
+  traderLoopRunning = true
+  console.log(
+    `[Trader] Enabled (margin ${(ordersTraderMarginPct * 100).toFixed(1)}%, ` +
+    `refresh ${ordersTraderRefreshMinMs}-${ordersTraderRefreshMaxMs}ms).`
+  )
+
+  while (traderLoopRunning) {
+    try {
+      if (!bot.player) {
+        await delay(1000)
+        continue
+      }
+
+      if (!traderCanOperateNow()) {
+        await delay(500)
+        continue
+      }
+
+      const needsOwnedSync =
+        traderOwnedOrders.length === 0 ||
+        Date.now() - traderLastOwnedSyncAt >= ordersTraderOwnedSyncMs
+
+      if (needsOwnedSync) {
+        await syncOwnedOrdersFromGui()
+      }
+
+      await runTraderMarketCycle()
+    } catch (err) {
+      console.warn('[Trader] Loop iteration failed:', err && err.message ? err.message : err)
+      await delay(1200)
+    }
+  }
+}
+
+// Grupo de tarea: control de sort, paginacion y flujo de search-all.
 function hasNextArrow (window) {
   if (!window || !Array.isArray(window.slots)) return false
   const item = window.slots[53]
@@ -734,14 +1970,18 @@ function getConfiguredSortKey (scope) {
   return normalizeOrderSortKey(configured, fallback)
 }
 
-function clickWindowSlot (slotIndex) {
+function clickWindowSlotMode (slotIndex, mouseButton = 0, mode = 0) {
   try {
-    bot.clickWindow(slotIndex, 0, 0)
+    bot.clickWindow(slotIndex, mouseButton, mode)
     return true
   } catch (err) {
     console.warn('Failed to click slot:', err && err.message ? err.message : err)
     return false
   }
+}
+
+function clickWindowSlot (slotIndex) {
+  return clickWindowSlotMode(slotIndex, 0, 0)
 }
 
 async function ensureSortOption (window, desiredKey, maxAttempts = 16) {
@@ -1032,6 +2272,7 @@ function trySendPendingChat () {
   }
 }
 
+// Grupo de tarea: helpers HTTP API y handlers de rutas.
 function readJsonBody (req) {
   return new Promise((resolve, reject) => {
     let body = ''
@@ -1060,6 +2301,54 @@ function sendJson (res, status, payload) {
   res.end(JSON.stringify(payload))
 }
 
+/*
+ * Tarea: normalizar campos comunes del payload del API.
+ * Input: payload JSON del request.
+ * Output: valores normalizados para endpoints track/alias.
+ * Uso: mantener el parseo en un solo lugar.
+ */
+function getApiProductKey (payload) {
+  return normalizeProductKey(payload?.productKey || payload?.product || '')
+}
+
+function getApiCommandName (payload) {
+  return payload?.commandName || payload?.ordersName || payload?.command || payload?.query || ''
+}
+
+/*
+ * Tarea: ejecutar handlers POST que requieren body JSON.
+ * Input: req/res mas handler(payload).
+ * Output: boolean success; envia 400 si el JSON es invalido.
+ * Uso: elimina bloques try/catch repetidos en rutas API.
+ */
+async function withJsonBody (req, res, handler) {
+  try {
+    const payload = await readJsonBody(req)
+    await handler(payload || {})
+    return true
+  } catch (err) {
+    sendJson(res, 400, { ok: false, error: 'Invalid JSON body' })
+    return false
+  }
+}
+
+async function handleTrackRequest (req, res, options = {}) {
+  const once = Boolean(options.once)
+  await withJsonBody(req, res, async (payload) => {
+    const productKey = getApiProductKey(payload)
+    const commandName = getApiCommandName(payload)
+    if (!productKey) {
+      sendJson(res, 400, { ok: false, error: 'Missing productKey' })
+      return
+    }
+    const key = once
+      ? trackProductOnce(productKey, { commandName })
+      : trackProduct(productKey, { immediate: true, commandName })
+    sendJson(res, 200, { ok: true, productKey: key })
+  })
+}
+
+// Grupo de tarea: HTTP API del bot usada por dashboard y automatizaciones locales.
 function startOrdersApiServer () {
   if (startOrdersApiServer.started) return
   startOrdersApiServer.started = true
@@ -1078,79 +2367,44 @@ function startOrdersApiServer () {
     const url = new URL(req.url, `http://${req.headers.host}`)
 
     if (url.pathname === '/track' && req.method === 'POST') {
-      try {
-        const payload = await readJsonBody(req)
-        const productKey = normalizeProductKey(payload.productKey || payload.product || '')
-        const commandName = payload.commandName || payload.ordersName || payload.command || payload.query || ''
-        if (!productKey) {
-          sendJson(res, 400, { ok: false, error: 'Missing productKey' })
-          return
-        }
-        const key = trackProduct(productKey, { immediate: true, commandName })
-        sendJson(res, 200, { ok: true, productKey: key })
-        return
-      } catch (err) {
-        sendJson(res, 400, { ok: false, error: 'Invalid JSON body' })
-        return
-      }
+      await handleTrackRequest(req, res, { once: false })
+      return
     }
 
     if (url.pathname === '/track-once' && req.method === 'POST') {
-      try {
-        const payload = await readJsonBody(req)
-        const productKey = normalizeProductKey(payload.productKey || payload.product || '')
-        const commandName = payload.commandName || payload.ordersName || payload.command || payload.query || ''
-        if (!productKey) {
-          sendJson(res, 400, { ok: false, error: 'Missing productKey' })
-          return
-        }
-        const key = trackProductOnce(productKey, { commandName })
-        sendJson(res, 200, { ok: true, productKey: key })
-        return
-      } catch (err) {
-        sendJson(res, 400, { ok: false, error: 'Invalid JSON body' })
-        return
-      }
+      await handleTrackRequest(req, res, { once: true })
+      return
     }
 
     if (url.pathname === '/untrack' && req.method === 'POST') {
-      try {
-        const payload = await readJsonBody(req)
-        const productKey = normalizeProductKey(payload.productKey || payload.product || '')
+      await withJsonBody(req, res, async (payload) => {
+        const productKey = getApiProductKey(payload)
         if (!productKey) {
           sendJson(res, 400, { ok: false, error: 'Missing productKey' })
           return
         }
         untrackProduct(productKey)
         sendJson(res, 200, { ok: true, productKey })
-        return
-      } catch (err) {
-        sendJson(res, 400, { ok: false, error: 'Invalid JSON body' })
-        return
-      }
+      })
+      return
     }
 
     if (url.pathname === '/alias' && req.method === 'POST') {
-      try {
-        const payload = await readJsonBody(req)
-        const productKey = normalizeProductKey(payload.productKey || payload.product || '')
-        const commandName = payload.commandName || payload.ordersName || payload.command || payload.query || ''
+      await withJsonBody(req, res, async (payload) => {
+        const productKey = getApiProductKey(payload)
+        const commandName = getApiCommandName(payload)
         if (!productKey) {
           sendJson(res, 400, { ok: false, error: 'Missing productKey' })
           return
         }
         const alias = setAlias(productKey, commandName)
         sendJson(res, 200, { ok: true, productKey, commandName: alias })
-        return
-      } catch (err) {
-        sendJson(res, 400, { ok: false, error: 'Invalid JSON body' })
-        return
-      }
+      })
+      return
     }
 
     if (url.pathname === '/say' && req.method === 'POST') {
-      try {
-        const payload = await readJsonBody(req)
+      await withJsonBody(req, res, async (payload) => {
         const message = String(payload.message || payload.text || '').trim()
         if (!message) {
           sendJson(res, 400, { ok: false, error: 'Missing message' })
@@ -1159,11 +2413,8 @@ function startOrdersApiServer () {
         pendingChatMessage = message.slice(0, 255)
         trySendPendingChat()
         sendJson(res, 200, { ok: true })
-        return
-      } catch (err) {
-        sendJson(res, 400, { ok: false, error: 'Invalid JSON body' })
-        return
-      }
+      })
+      return
     }
 
     if (url.pathname === '/queue' && req.method === 'GET') {
@@ -1228,8 +2479,7 @@ function startOrdersApiServer () {
     }
 
     if (url.pathname === '/order-config' && req.method === 'POST') {
-      try {
-        const payload = await readJsonBody(req)
+      await withJsonBody(req, res, async (payload) => {
         const nextSearchAllSort = normalizeOrderSortKey(
           payload.searchAllSort || payload.searchAll || payload?.sort?.searchAll,
           getConfiguredSortKey('searchAll')
@@ -1249,11 +2499,8 @@ function startOrdersApiServer () {
           trackingSort: ordersConfig.trackingSort,
           options: sortOptions
         })
-        return
-      } catch (err) {
-        sendJson(res, 400, { ok: false, error: 'Invalid JSON body' })
-        return
-      }
+      })
+      return
     }
 
     if (url.pathname === '/alerts' && req.method === 'GET') {
@@ -1266,8 +2513,7 @@ function startOrdersApiServer () {
     }
 
     if (url.pathname === '/alerts' && req.method === 'POST') {
-      try {
-        const payload = await readJsonBody(req)
+      await withJsonBody(req, res, async (payload) => {
         const webhookUrl = typeof payload.webhookUrl === 'string' ? payload.webhookUrl.trim() : ''
         const rules = Array.isArray(payload.rules)
           ? payload.rules.map(normalizeAlertRule).filter(Boolean)
@@ -1275,11 +2521,8 @@ function startOrdersApiServer () {
         alertsConfig = { webhookUrl, rules }
         saveAlertsConfig()
         sendJson(res, 200, { ok: true })
-        return
-      } catch (err) {
-        sendJson(res, 400, { ok: false, error: 'Invalid JSON body' })
-        return
-      }
+      })
+      return
     }
 
     sendJson(res, 404, { ok: false, error: 'Not found' })
@@ -1290,6 +2533,7 @@ function startOrdersApiServer () {
   })
 }
 
+// Grupo de tarea: eventos de ventana y pipeline de captura de snapshots.
 function closeOrdersWindow (window) {
   try {
     bot.closeWindow(window)
@@ -1366,6 +2610,7 @@ bot.on('windowOpen', async (window) => {
 })
 
 bot.on('kicked', (reason) => {
+  traderLoopRunning = false
   console.log('Kicked:', reason)
 })
 
@@ -1374,10 +2619,12 @@ bot.on('error', (err) => {
 })
 
 bot.on('end', () => {
+  traderLoopRunning = false
   console.log('Disconnected')
 })
 
 
+// Grupo de tarea: parseo lore/order, persistencia de snapshots y alerts webhook.
 function captureOrdersSnapshot (window, meta) {
   return dumpWindowSlotsWithMeta(window, meta)
 }

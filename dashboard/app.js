@@ -105,6 +105,87 @@ let orderConfig = {
   trackingSort: 'most_money_per_item'
 }
 
+/*
+ * Tarea: centralizar llamadas POST JSON al API del bot.
+ * Input: nombre del endpoint y payload.
+ * Output: objeto Response de fetch.
+ * Uso: tracking, aliases, alertas, chat y config de orden.
+ */
+function postBotJson (endpoint, payload = {}) {
+  return fetch(`${botApiBase}/${endpoint}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  })
+}
+
+/*
+ * Tarea: mantener consistente el comportamiento de alias input.
+ * Input: elemento input y productKey.
+ * Output: sin retorno (registra listeners del DOM).
+ * Uso: lista tracked y filas de craft para evitar listeners duplicados.
+ */
+function bindAliasInputEvents (aliasInput, productKey) {
+  if (!aliasInput || !productKey) return
+  aliasInput.addEventListener('click', (event) => {
+    event.stopPropagation()
+  })
+  aliasInput.addEventListener('change', () => {
+    applyAlias(productKey, aliasInput.value)
+  })
+  aliasInput.addEventListener('keydown', (event) => {
+    event.stopPropagation()
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      aliasInput.blur()
+    }
+  })
+}
+
+/*
+ * Tarea: encolar tracking de enchanted_book desde acciones UI compartidas.
+ * Input: `once` boolean y contexto opcional (anchor/highlights).
+ * Output: Promise de trackProductsBatch.
+ * Uso: acciones de craft y margenes.
+ */
+function queueBookTracking (once, options = {}) {
+  const anchorKey = String(options.anchorKey || selectedProduct?.key || 'enchanted_book')
+  return trackProductsBatch(['enchanted_book'], {
+    ...options,
+    once: Boolean(once),
+    anchorKey
+  })
+}
+
+/*
+ * Tarea: conectar botones "Track once/always" para enchanted books.
+ * Input: nodo raiz DOM + selectores + anchor key.
+ * Output: sin retorno (registra listeners del DOM).
+ * Uso: resumen de craft y controles por fila.
+ */
+function bindBookTrackingButtons (root, options = {}) {
+  if (!root) return
+  const onceSelector = options.onceSelector || '[data-book-action="once"]'
+  const alwaysSelector = options.alwaysSelector || '[data-book-action="always"]'
+  const anchorKey = String(options.anchorKey || selectedProduct?.key || 'enchanted_book')
+  const onceButton = root.querySelector(onceSelector)
+  const alwaysButton = root.querySelector(alwaysSelector)
+
+  if (onceButton) {
+    onceButton.addEventListener('click', (event) => {
+      event.stopPropagation()
+      queueBookTracking(true, { anchorKey })
+    })
+  }
+  if (alwaysButton) {
+    alwaysButton.addEventListener('click', (event) => {
+      event.stopPropagation()
+      queueBookTracking(false, { anchorKey })
+    })
+  }
+}
+
+// Grupo de tarea: formato, parse helpers y controles UI de order-config.
 function formatPrice (value) {
   if (value >= 1_000_000_000) return `$${(value / 1_000_000_000).toFixed(1)}B`
   if (value >= 1_000_000) return `$${(value / 1_000_000).toFixed(1)}M`
@@ -222,11 +303,7 @@ async function saveOrderConfig () {
   }
   try {
     setOrderConfigStatus('Saving order configuration...')
-    const res = await fetch(`${botApiBase}/order-config`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    })
+    const res = await postBotJson('order-config', payload)
     if (!res.ok) throw new Error('Failed to save')
     const data = await res.json()
     orderConfig = {
@@ -319,6 +396,7 @@ function initSidebarSections () {
   }
 }
 
+// Grupo de tarea: normalizacion de items y modelo de variantes grouped/tracked.
 function normalizeItemKey (value) {
   return (value || '')
     .toLowerCase()
@@ -1158,11 +1236,7 @@ function updateTrackButton () {
 async function applyAlias (productKey, value) {
   const commandName = (value || '').trim()
   try {
-    const res = await fetch(`${botApiBase}/alias`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ productKey, commandName })
-    })
+    const res = await postBotJson('alias', { productKey, commandName })
     if (res.ok) {
       await loadQueueState()
     }
@@ -1222,21 +1296,7 @@ function renderTrackedList () {
     `
 
     const aliasInput = wrapper.querySelector('.alias-input')
-    if (aliasInput) {
-      aliasInput.addEventListener('click', (event) => {
-        event.stopPropagation()
-      })
-      aliasInput.addEventListener('change', () => {
-        applyAlias(entry.key, aliasInput.value)
-      })
-      aliasInput.addEventListener('keydown', (event) => {
-        event.stopPropagation()
-        if (event.key === 'Enter') {
-          event.preventDefault()
-          aliasInput.blur()
-        }
-      })
-    }
+    bindAliasInputEvents(aliasInput, entry.key)
 
     wrapper.addEventListener('click', () => {
       if (item) {
@@ -1337,6 +1397,8 @@ function setAlertsTab (tab) {
   if (alertsApiView) alertsApiView.hidden = tab !== 'api'
   renderAlerts()
 }
+
+// Grupo de tarea: acciones track/untrack e interaccion con cola desde UI.
 async function trackSelectedProduct () {
   if (!selectedProduct?.key) return
 
@@ -1353,11 +1415,7 @@ async function toggleTrack (productKey, commandName) {
     if (endpoint === 'track' && commandName) {
       payload.commandName = commandName
     }
-    const res = await fetch(`${botApiBase}/${endpoint}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    })
+    const res = await postBotJson(endpoint, payload)
 
     if (res.ok) {
       await loadQueueState()
@@ -1376,11 +1434,7 @@ async function sendTrackRequest (productKey, options = {}) {
   if (options.commandName) {
     payload.commandName = String(options.commandName).trim()
   }
-  const res = await fetch(`${botApiBase}/${endpoint}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  })
+  const res = await postBotJson(endpoint, payload)
   return res.ok
 }
 
@@ -1576,6 +1630,7 @@ function getMaxSlot (snapshot, keyOverride = null, options = {}) {
   }
 }
 
+// Grupo de tarea: carga de snapshots/all-pages/recipe y calculo de estadisticas.
 async function loadItemsCatalog () {
   try {
     const res = await fetch('/api/items')
@@ -1766,20 +1821,11 @@ function renderCraftSection () {
         <button data-book-track="always" type="button">Track always</button>
       </div>
     `
-    const onceButton = booksMetric.querySelector('[data-book-track="once"]')
-    const alwaysButton = booksMetric.querySelector('[data-book-track="always"]')
-    if (onceButton) {
-      onceButton.addEventListener('click', (event) => {
-        event.stopPropagation()
-        trackProductsBatch(['enchanted_book'], { once: true, anchorKey: selectedProduct?.key || 'enchanted_book' })
-      })
-    }
-    if (alwaysButton) {
-      alwaysButton.addEventListener('click', (event) => {
-        event.stopPropagation()
-        trackProductsBatch(['enchanted_book'], { once: false, anchorKey: selectedProduct?.key || 'enchanted_book' })
-      })
-    }
+    bindBookTrackingButtons(booksMetric, {
+      onceSelector: '[data-book-track="once"]',
+      alwaysSelector: '[data-book-track="always"]',
+      anchorKey: selectedProduct?.key || 'enchanted_book'
+    })
     craftSummary.appendChild(booksMetric)
   }
 
@@ -1821,20 +1867,9 @@ function renderCraftSection () {
     `
 
     if (component.type === 'book') {
-      const onceButton = row.querySelector('[data-book-action="once"]')
-      const alwaysButton = row.querySelector('[data-book-action="always"]')
-      if (onceButton) {
-        onceButton.addEventListener('click', (event) => {
-          event.stopPropagation()
-          trackProductsBatch(['enchanted_book'], { once: true, anchorKey: selectedProduct?.key || 'enchanted_book' })
-        })
-      }
-      if (alwaysButton) {
-        alwaysButton.addEventListener('click', (event) => {
-          event.stopPropagation()
-          trackProductsBatch(['enchanted_book'], { once: false, anchorKey: selectedProduct?.key || 'enchanted_book' })
-        })
-      }
+      bindBookTrackingButtons(row, {
+        anchorKey: selectedProduct?.key || 'enchanted_book'
+      })
     } else {
       const button = row.querySelector('[data-item-action="toggle"]')
       if (button) {
@@ -1847,21 +1882,7 @@ function renderCraftSection () {
       }
 
       const aliasInput = row.querySelector('.alias-input')
-      if (aliasInput) {
-        aliasInput.addEventListener('click', (event) => {
-          event.stopPropagation()
-        })
-        aliasInput.addEventListener('change', () => {
-          applyAlias(component.key, aliasInput.value)
-        })
-        aliasInput.addEventListener('keydown', (event) => {
-          event.stopPropagation()
-          if (event.key === 'Enter') {
-            event.preventDefault()
-            aliasInput.blur()
-          }
-        })
-      }
+      bindAliasInputEvents(aliasInput, component.key)
     }
 
     craftList.appendChild(row)
@@ -2058,6 +2079,7 @@ function getPreferredPriceStats (productKey, sinceMs, options = {}) {
   }
 }
 
+// Grupo de tarea: busquedas grouped/margins y vistas de ranking.
 function getGroupedSearchCandidates (query) {
   const text = String(query || '').trim().toLowerCase()
   const tokens = text.split(/[\s,]+/).filter((token) => token.length > 0)
@@ -2348,11 +2370,7 @@ async function loadAlertsConfig () {
 
 async function saveAlertsConfig () {
   try {
-    await fetch(`${botApiBase}/alerts`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(alertsConfig)
-    })
+    await postBotJson('alerts', alertsConfig)
   } catch (err) {
     console.error(err)
   }
@@ -2449,6 +2467,58 @@ async function fetchRecipeCached (itemKey) {
     .catch(() => null)
   recipeCache.set(itemKey, promise)
   return promise
+}
+
+/*
+ * Tarea: mapear acciones de tabla de margenes a batches de tracking.
+ * Input: `row` de margenes y action id (item/material/book, once/always).
+ * Output: Promise<void>.
+ * Uso: botones de margenes para definir el flujo en un solo lugar.
+ */
+async function runMarginRowTrackAction (row, action) {
+  if (!row || !action) return
+  const shared = {
+    anchorKey: row.id,
+    highlightRowIds: [row.id]
+  }
+  if (action === 'item-once') {
+    await trackProductsBatch([row.baseKey], { ...shared, once: true })
+    return
+  }
+  if (action === 'item-always') {
+    await trackProductsBatch([row.baseKey], { ...shared, once: false })
+    return
+  }
+  const materialKeys = [...new Set((row.materials || []).map((material) => material.key).filter(Boolean))]
+  if (action === 'materials-once') {
+    await trackProductsBatch(materialKeys, {
+      ...shared,
+      once: true,
+      highlightKeys: materialKeys
+    })
+    return
+  }
+  if (action === 'materials-always') {
+    await trackProductsBatch(materialKeys, {
+      ...shared,
+      once: false,
+      highlightKeys: materialKeys
+    })
+    return
+  }
+  if (action === 'books-once') {
+    await queueBookTracking(true, {
+      ...shared,
+      highlightKeys: ['enchanted_book']
+    })
+    return
+  }
+  if (action === 'books-always') {
+    await queueBookTracking(false, {
+      ...shared,
+      highlightKeys: ['enchanted_book']
+    })
+  }
 }
 
 async function renderMargins () {
@@ -2673,51 +2743,8 @@ async function renderMargins () {
     actionButtons.forEach((button) => {
       button.addEventListener('click', async (event) => {
         event.stopPropagation()
-        const action = button.getAttribute('data-action')
-        if (action === 'item-once') {
-          await trackProductsBatch([row.baseKey], { once: true, anchorKey: row.id, highlightRowIds: [row.id] })
-          return
-        }
-        if (action === 'item-always') {
-          await trackProductsBatch([row.baseKey], { once: false, anchorKey: row.id, highlightRowIds: [row.id] })
-          return
-        }
-        const materialKeys = [...new Set(row.materials.map((material) => material.key).filter(Boolean))]
-        if (action === 'materials-once') {
-          await trackProductsBatch(materialKeys, {
-            once: true,
-            anchorKey: row.id,
-            highlightKeys: materialKeys,
-            highlightRowIds: [row.id]
-          })
-          return
-        }
-        if (action === 'materials-always') {
-          await trackProductsBatch(materialKeys, {
-            once: false,
-            anchorKey: row.id,
-            highlightKeys: materialKeys,
-            highlightRowIds: [row.id]
-          })
-          return
-        }
-        if (action === 'books-once') {
-          await trackProductsBatch(['enchanted_book'], {
-            once: true,
-            anchorKey: row.id,
-            highlightKeys: ['enchanted_book'],
-            highlightRowIds: [row.id]
-          })
-          return
-        }
-        if (action === 'books-always') {
-          await trackProductsBatch(['enchanted_book'], {
-            once: false,
-            anchorKey: row.id,
-            highlightKeys: ['enchanted_book'],
-            highlightRowIds: [row.id]
-          })
-        }
+        const action = String(button.getAttribute('data-action') || '')
+        await runMarginRowTrackAction(row, action)
       })
     })
 
@@ -2788,6 +2815,7 @@ function getAlertHitIndexes (snapshotsList) {
   return hits
 }
 
+// Grupo de tarea: render de chart + snapshot/grid.
 function renderChart () {
   const dpr = window.devicePixelRatio || 1
   const rect = chart.getBoundingClientRect()
@@ -3351,6 +3379,7 @@ window.addEventListener('resize', () => {
   renderChart()
 })
 
+// Grupo de tarea: bootstrap de listeners y loops de refresco periodico.
 async function init () {
   await loadItemsCatalog()
   initSidebarSections()
@@ -3403,11 +3432,7 @@ async function init () {
       if (!message) return
       chatSendButton.disabled = true
       try {
-        const res = await fetch(`${botApiBase}/say`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message })
-        })
+        const res = await postBotJson('say', { message })
         if (res.ok) {
           chatMessageInput.value = ''
         }

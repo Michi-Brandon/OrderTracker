@@ -60,6 +60,14 @@ ORDERS_API_PORT=3010
 ORDERS_AUTOTRACK=1
 ORDERS_PRODUCT=repeater
 ORDERS_CMD_PREFIX=/orders
+ORDERS_SPAWN_PROBE=1
+
+ORDERS_TRADER_ENABLED=0
+ORDERS_TRADER_MARGIN_PCT=0.5
+ORDERS_TRADER_REFRESH_MIN_MS=500
+ORDERS_TRADER_REFRESH_MAX_MS=5490
+ORDERS_TRADER_OWNED_SYNC_MS=30000
+ORDERS_TRADER_CONFIRM_TIMEOUT_MS=5000
 ```
 
 ## Tracking & Aliases
@@ -81,6 +89,13 @@ orders-tracked.json
 Snapshots are stored as JSONL:
 ```
 orders-snapshots.jsonl
+```
+
+Trader state files:
+```
+orders-owned.json
+orders-market-state.json
+orders-trader-deals.jsonl
 ```
 
 ## Notes

@@ -27,6 +27,7 @@ const itemTextureMap = new Map()
 const blockTextureMap = new Map()
 const inlineTextureMap = new Map()
 
+// Grupo de tarea: carga de indices de texturas y resolucion de archivos.
 function loadTextureIndex (filePath, targetMap) {
   if (!fs.existsSync(filePath)) return
   try {
@@ -101,6 +102,12 @@ loadTextureIndex(itemsTexturesPath, itemTextureMap)
 loadTextureIndex(blocksTexturesPath, blockTextureMap)
 loadInlineTextures(textureContentPath, inlineTextureMap)
 
+/*
+ * Tarea: construir payload simple de receta desde minecraft-data.
+ * Input: item key (ej. "diamond_sword").
+ * Output: `{ result, ingredients }` o `null` si no hay receta.
+ * Uso: endpoint `/api/recipe` para calculos de craft/margen en dashboard.
+ */
 function buildRecipe (itemName) {
   if (!itemName) return null
   if (recipesCache.has(itemName)) return recipesCache.get(itemName)
@@ -168,36 +175,34 @@ const mimeTypes = {
   '.svg': 'image/svg+xml'
 }
 
-function readSnapshots () {
-  if (!fs.existsSync(dataPath)) return []
-  const raw = fs.readFileSync(dataPath, 'utf8')
+/*
+ * Tarea: leer un JSONL y devolver entradas ordenadas por timestamp.
+ * Input: path del archivo.
+ * Output: array de objetos parseados (lineas invalidas se ignoran).
+ * Uso: `/api/snapshots` y `/api/all`.
+ */
+function readJsonlSorted (filePath) {
+  if (!fs.existsSync(filePath)) return []
+  const raw = fs.readFileSync(filePath, 'utf8')
   const lines = raw.split(/\r?\n/).filter((line) => line.trim() !== '')
-  const snapshots = []
+  const rows = []
   for (const line of lines) {
     try {
-      snapshots.push(JSON.parse(line))
+      rows.push(JSON.parse(line))
     } catch (err) {
       // ignore bad lines
     }
   }
-  snapshots.sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime())
-  return snapshots
+  rows.sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime())
+  return rows
+}
+
+function readSnapshots () {
+  return readJsonlSorted(dataPath)
 }
 
 function readAllPages () {
-  if (!fs.existsSync(allDataPath)) return []
-  const raw = fs.readFileSync(allDataPath, 'utf8')
-  const lines = raw.split(/\r?\n/).filter((line) => line.trim() !== '')
-  const pages = []
-  for (const line of lines) {
-    try {
-      pages.push(JSON.parse(line))
-    } catch (err) {
-      // ignore bad lines
-    }
-  }
-  pages.sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime())
-  return pages
+  return readJsonlSorted(allDataPath)
 }
 
 function sendJson (res, status, payload) {
@@ -221,6 +226,7 @@ function serveFile (res, filePath) {
   fs.createReadStream(filePath).pipe(res)
 }
 
+// Grupo de tarea: ruteo HTTP para APIs del dashboard + archivos estaticos.
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`)
 
